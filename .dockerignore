@@ -75,3 +75,9 @@ test_*.py
 # Environment files
 .env
 .env.*
+
+# Local secrets / artifacts (deployment-specific)
+data/
+*.har*
+*.tar.gz
+scripts/

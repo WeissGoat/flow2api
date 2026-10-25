@@ -2,14 +2,23 @@ version: '3.8'
 
 services:
   flow2api:
-    image: ghcr.io/thesmallhancat/flow2api:latest
+    # 有头浏览器打码（captcha_method=browser）：容器内 Xvfb + Playwright Chromium
+    init: true
+    build:
+      context: .
+      dockerfile: Dockerfile.headed
+    image: flow2api:headed
     container_name: flow2api
     ports:
-      - "38000:8000"
+      - "127.0.0.1:38000:8000"
     volumes:
       - ./data:/app/data
       - ./tmp:/app/tmp
       - ./config/setting.toml:/app/config/setting.toml
     environment:
       - PYTHONUNBUFFERED=1
+      - ALLOW_DOCKER_HEADED_CAPTCHA=true
+      - DISPLAY=:99
+      - XVFB_SCREEN=1440x900x24
+    shm_size: "2gb"
     restart: unless-stopped

@@ -1,0 +1,10 @@
+services:
+  flow2api-cloudflared:
+    image: cloudflare/cloudflared:latest
+    pull_policy: always
+    container_name: flow2api-cloudflared
+    network_mode: host
+    command: tunnel --no-autoupdate run --token ${FLOW2API_CLOUDFLARED_TOKEN}
+    restart: unless-stopped
+    depends_on:
+      - flow2api
