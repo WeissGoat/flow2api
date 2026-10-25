@@ -141,8 +141,8 @@ async function connectWS() {
 async function handleGetToken(data) {
     let newTabId = null;
     try {
-        console.log("[Flow2API] Auto-opening fresh Google Labs tab to avoid token expiry...");
-        const newTab = await chrome.tabs.create({ url: "https://labs.google/fx/tools/flow", active: false });
+        console.log("[Flow2API] Auto-opening fresh Google Flow tab to avoid token expiry...");
+        const newTab = await chrome.tabs.create({ url: "https://flow.google.com/", active: false });
         newTabId = newTab.id;
 
         await waitForTabReady(newTabId);
