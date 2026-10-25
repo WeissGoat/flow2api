@@ -148,8 +148,9 @@ class FlowFrontendMixin:
             "IMAGE_ASPECT_RATIO_PORTRAIT": 2,
             "IMAGE_ASPECT_RATIO_16_9": 3,
             "IMAGE_ASPECT_RATIO_LANDSCAPE": 3,
-            "IMAGE_ASPECT_RATIO_LANDSCAPE_FOUR_THREE": 4,
-            "IMAGE_ASPECT_RATIO_PORTRAIT_THREE_FOUR": 5,
+            # 本地补丁：按新版前端 WXa 映射，4:3=5、3:4=4（原先写反）
+            "IMAGE_ASPECT_RATIO_LANDSCAPE_FOUR_THREE": 5,
+            "IMAGE_ASPECT_RATIO_PORTRAIT_THREE_FOUR": 4,
         }
         try:
             return mapping[str(aspect_ratio or "").strip().upper()]

@@ -5208,8 +5208,10 @@ class _FlowClientBase(FlowFrontendMixin):
                 token, browser_id, fingerprint = await service.get_token(
                     project_id, action, token_id=token_id
                 )
-                if token and not self._extract_browser_captcha_session_id(
-                    browser_id
+                if (
+                    token
+                    and str(action or "").upper() == "CHAT_GENERATION"
+                    and not self._extract_browser_captcha_session_id(browser_id)
                 ):
                     debug_logger.log_warning(
                         "[reCAPTCHA Browser] harvest 未返回会话 id，生成请求可能被拒"

@@ -377,7 +377,17 @@ class CurrentFlowClientMixin:
                 #   页面实际执行的 reCAPTCHA action 为 CHAT_GENERATION。
                 # - 第三方打码 (yescaptcha 等)：token 只被 batchexecute 通道接受，
                 #   走原 ogiZ0b 链路，action 保持上游既有的 IMAGE_GENERATION。
-                stream_transport = config.captcha_method == "browser"
+                # 本地补丁：StreamChat 不带参考图，图生图在 browser 模式下
+                # 改走 ogiZ0b，token 由内置浏览器 direct 打码提供（不再用第三方）；
+                # 纯文生图仍走 browser harvest。
+                stream_transport = (
+                    config.captcha_method == "browser" and not image_inputs
+                )
+                captcha_override = (
+                    self._resolve_batchexecute_captcha_override()
+                    if config.captcha_method == "browser" and image_inputs
+                    else None
+                )
                 token, browser_id = await self._get_recaptcha_token(
                     project_id,
                     action=(
@@ -385,6 +395,7 @@ class CurrentFlowClientMixin:
                     ),
                     token_id=token_id,
                     website_url=self._build_flow_frontend_project_page_url(project_id),
+                    method_override=captcha_override,
                 )
                 attempt["recaptcha_ok"] = bool(token)
                 if not token:
@@ -491,6 +502,10 @@ class CurrentFlowClientMixin:
         browser 类模式下必须配置第三方打码密钥，否则直接返回明确配置错误。
         """
         if config.captcha_method not in ("browser", "personal", "remote_browser", "extension"):
+            return None
+        # 本地补丁：browser 模式改用内置浏览器 direct 打码（原版 execute），
+        # 失败即报错，不回退第三方打码，便于观察。
+        if config.captcha_method == "browser":
             return None
         method = self._resolve_third_party_captcha_method()
         if not method:

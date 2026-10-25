@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import hashlib
 import json
 import time
 from pathlib import Path
@@ -121,89 +122,89 @@ MODEL_CONFIG = {
         "model_name": "IMAGEN_3_5",
         "aspect_ratio": "IMAGE_ASPECT_RATIO_PORTRAIT",
     },
-    # 图片生成 - NARWHAL (新版)
+    # 图片生成 - Nano Banana 2（本地补丁：Flow 2026-10 起模型键 NARWHAL → BELUGA）
     "gemini-3.1-flash-image-landscape": {
         "type": "image",
-        "model_name": "NARWHAL",
+        "model_name": "BELUGA",
         "aspect_ratio": "IMAGE_ASPECT_RATIO_LANDSCAPE",
     },
     "gemini-3.1-flash-image-portrait": {
         "type": "image",
-        "model_name": "NARWHAL",
+        "model_name": "BELUGA",
         "aspect_ratio": "IMAGE_ASPECT_RATIO_PORTRAIT",
     },
     "gemini-3.1-flash-image-square": {
         "type": "image",
-        "model_name": "NARWHAL",
+        "model_name": "BELUGA",
         "aspect_ratio": "IMAGE_ASPECT_RATIO_SQUARE",
     },
     "gemini-3.1-flash-image-four-three": {
         "type": "image",
-        "model_name": "NARWHAL",
+        "model_name": "BELUGA",
         "aspect_ratio": "IMAGE_ASPECT_RATIO_LANDSCAPE_FOUR_THREE",
     },
     "gemini-3.1-flash-image-three-four": {
         "type": "image",
-        "model_name": "NARWHAL",
+        "model_name": "BELUGA",
         "aspect_ratio": "IMAGE_ASPECT_RATIO_PORTRAIT_THREE_FOUR",
     },
     "gemini-3.1-flash-image-landscape-2k": {
         "type": "image",
-        "model_name": "NARWHAL",
+        "model_name": "BELUGA",
         "aspect_ratio": "IMAGE_ASPECT_RATIO_LANDSCAPE",
         "upsample": "UPSAMPLE_IMAGE_RESOLUTION_2K",
     },
     "gemini-3.1-flash-image-portrait-2k": {
         "type": "image",
-        "model_name": "NARWHAL",
+        "model_name": "BELUGA",
         "aspect_ratio": "IMAGE_ASPECT_RATIO_PORTRAIT",
         "upsample": "UPSAMPLE_IMAGE_RESOLUTION_2K",
     },
     "gemini-3.1-flash-image-square-2k": {
         "type": "image",
-        "model_name": "NARWHAL",
+        "model_name": "BELUGA",
         "aspect_ratio": "IMAGE_ASPECT_RATIO_SQUARE",
         "upsample": "UPSAMPLE_IMAGE_RESOLUTION_2K",
     },
     "gemini-3.1-flash-image-four-three-2k": {
         "type": "image",
-        "model_name": "NARWHAL",
+        "model_name": "BELUGA",
         "aspect_ratio": "IMAGE_ASPECT_RATIO_LANDSCAPE_FOUR_THREE",
         "upsample": "UPSAMPLE_IMAGE_RESOLUTION_2K",
     },
     "gemini-3.1-flash-image-three-four-2k": {
         "type": "image",
-        "model_name": "NARWHAL",
+        "model_name": "BELUGA",
         "aspect_ratio": "IMAGE_ASPECT_RATIO_PORTRAIT_THREE_FOUR",
         "upsample": "UPSAMPLE_IMAGE_RESOLUTION_2K",
     },
     "gemini-3.1-flash-image-landscape-4k": {
         "type": "image",
-        "model_name": "NARWHAL",
+        "model_name": "BELUGA",
         "aspect_ratio": "IMAGE_ASPECT_RATIO_LANDSCAPE",
         "upsample": "UPSAMPLE_IMAGE_RESOLUTION_4K",
     },
     "gemini-3.1-flash-image-portrait-4k": {
         "type": "image",
-        "model_name": "NARWHAL",
+        "model_name": "BELUGA",
         "aspect_ratio": "IMAGE_ASPECT_RATIO_PORTRAIT",
         "upsample": "UPSAMPLE_IMAGE_RESOLUTION_4K",
     },
     "gemini-3.1-flash-image-square-4k": {
         "type": "image",
-        "model_name": "NARWHAL",
+        "model_name": "BELUGA",
         "aspect_ratio": "IMAGE_ASPECT_RATIO_SQUARE",
         "upsample": "UPSAMPLE_IMAGE_RESOLUTION_4K",
     },
     "gemini-3.1-flash-image-four-three-4k": {
         "type": "image",
-        "model_name": "NARWHAL",
+        "model_name": "BELUGA",
         "aspect_ratio": "IMAGE_ASPECT_RATIO_LANDSCAPE_FOUR_THREE",
         "upsample": "UPSAMPLE_IMAGE_RESOLUTION_4K",
     },
     "gemini-3.1-flash-image-three-four-4k": {
         "type": "image",
-        "model_name": "NARWHAL",
+        "model_name": "BELUGA",
         "aspect_ratio": "IMAGE_ASPECT_RATIO_PORTRAIT_THREE_FOUR",
         "upsample": "UPSAMPLE_IMAGE_RESOLUTION_4K",
     },
@@ -1112,15 +1113,15 @@ def _apply_current_flow_model_catalog():
     for config_entry in MODEL_CONFIG.values():
         config_entry["listed"] = False
 
-    # NARWHAL remains the current image-generation RPC model. Older image
+    # BELUGA（原 NARWHAL）是当前图片生成 RPC 的模型键。Older image
     # aliases continue to resolve but no longer clutter the public catalog.
     for model_id, config_entry in MODEL_CONFIG.items():
         if (
             config_entry.get("type") == "image"
-            and config_entry.get("model_name") == "NARWHAL"
+            and config_entry.get("model_name") == "BELUGA"
         ):
             config_entry["listed"] = True
-            config_entry["display_name"] = "Flow Image - NARWHAL"
+            config_entry["display_name"] = "Flow Image - Nano Banana 2"
 
     def register(model_id: str, config_entry: Dict[str, Any], display_name: str):
         config_entry = dict(config_entry)
@@ -1396,6 +1397,33 @@ class GenerationHandler:
             proxy_manager=proxy_manager,
             flow_client=flow_client,
         )
+        # 本地补丁：参考图上传缓存 (token_id, sha256) -> (mediaId, 上传时间)；
+        # 项目池轮询会让每次请求换项目，mediaId 可跨项目引用，所以不按项目区分
+        self._upload_media_cache: Dict[tuple, tuple] = {}
+
+    UPLOAD_CACHE_TTL_SECONDS = 6 * 3600
+    UPLOAD_CACHE_MAX_ENTRIES = 512
+
+    @staticmethod
+    def _upload_cache_key(token_id, image_bytes: bytes) -> tuple:
+        return (token_id, hashlib.sha256(image_bytes).hexdigest())
+
+    def _get_cached_upload(self, key: tuple) -> Optional[str]:
+        entry = self._upload_media_cache.get(key)
+        if not entry:
+            return None
+        media_id, uploaded_at = entry
+        if time.time() - uploaded_at > self.UPLOAD_CACHE_TTL_SECONDS:
+            self._upload_media_cache.pop(key, None)
+            return None
+        return media_id
+
+    def _store_cached_upload(self, key: tuple, media_id: str):
+        if not media_id:
+            return
+        self._upload_media_cache[key] = (media_id, time.time())
+        while len(self._upload_media_cache) > self.UPLOAD_CACHE_MAX_ENTRIES:
+            self._upload_media_cache.pop(next(iter(self._upload_media_cache)))
 
     def _create_generation_result(self) -> Dict[str, Any]:
         """????????????????"""
@@ -2078,26 +2106,50 @@ class GenerationHandler:
                         f"上传 {len(images)} 张参考图片...\n"
                     )
 
-                # 支持多图输入
-                for idx, image_bytes in enumerate(images):
-                    media_id = await self.flow_client.upload_image(
-                        token.at,
-                        image_bytes,
-                        model_config["aspect_ratio"],
-                        project_id=project_id,
-                        token_id=token.id,
-                        google_cookies=getattr(token, "google_cookies", None),
+                # 本地补丁：同一项目内相同参考图复用已上传的 mediaId，其余并行上传
+                upload_keys = [
+                    self._upload_cache_key(token.id, image_bytes)
+                    for image_bytes in images
+                ]
+                media_ids: Dict[tuple, str] = {}
+                pending_uploads: Dict[tuple, bytes] = {}
+                for key, image_bytes in zip(upload_keys, images):
+                    cached_media_id = self._get_cached_upload(key)
+                    if cached_media_id:
+                        media_ids[key] = cached_media_id
+                    elif key not in pending_uploads:
+                        pending_uploads[key] = image_bytes
+                cache_hits = sum(1 for key in upload_keys if key in media_ids)
+                if pending_uploads:
+                    uploaded_ids = await asyncio.gather(
+                        *[
+                            self.flow_client.upload_image(
+                                token.at,
+                                image_bytes,
+                                model_config["aspect_ratio"],
+                                project_id=project_id,
+                                token_id=token.id,
+                                google_cookies=getattr(token, "google_cookies", None),
+                            )
+                            for image_bytes in pending_uploads.values()
+                        ]
                     )
-                    image_inputs.append(
-                        {
-                        "name": media_id,
-                            "imageInputType": "IMAGE_INPUT_TYPE_REFERENCE",
-                        }
+                    for key, media_id in zip(pending_uploads, uploaded_ids):
+                        media_ids[key] = media_id
+                        self._store_cached_upload(key, media_id)
+                image_inputs = [
+                    {
+                        "name": media_ids[key],
+                        "imageInputType": "IMAGE_INPUT_TYPE_REFERENCE",
+                    }
+                    for key in upload_keys
+                ]
+                if image_trace is not None:
+                    image_trace["upload_cache_hits"] = cache_hits
+                if stream:
+                    yield self._create_stream_chunk(
+                        f"参考图片就绪 {len(images)} 张（复用 {cache_hits} 张）\n"
                     )
-                    if stream:
-                        yield self._create_stream_chunk(
-                            f"已上传第 {idx + 1}/{len(images)} 张图片\n"
-                        )
             if image_trace is not None:
                 image_trace["upload_images_ms"] = int(
                     (time.time() - upload_started_at) * 1000
@@ -2123,22 +2175,29 @@ class GenerationHandler:
                 )
 
             generate_started_at = time.time()
-            (
-                result,
-                generation_session_id,
-                upstream_trace,
-            ) = await self.flow_client.generate_image(
-                at=token.at,
-                project_id=project_id,
-                prompt=prompt,
-                model_name=model_config["model_name"],
-                aspect_ratio=model_config["aspect_ratio"],
-                image_inputs=image_inputs,
-                token_id=token.id,
-                token_image_concurrency=token.image_concurrency,
-                progress_callback=_image_progress_callback,
-                google_cookies=getattr(token, "google_cookies", None),
-            )
+            try:
+                (
+                    result,
+                    generation_session_id,
+                    upstream_trace,
+                ) = await self.flow_client.generate_image(
+                    at=token.at,
+                    project_id=project_id,
+                    prompt=prompt,
+                    model_name=model_config["model_name"],
+                    aspect_ratio=model_config["aspect_ratio"],
+                    image_inputs=image_inputs,
+                    token_id=token.id,
+                    token_image_concurrency=token.image_concurrency,
+                    progress_callback=_image_progress_callback,
+                    google_cookies=getattr(token, "google_cookies", None),
+                )
+            except Exception:
+                # 生成失败时丢弃本次用到的上传缓存，避免失效的 mediaId 一直被复用
+                if images:
+                    for key in upload_keys:
+                        self._upload_media_cache.pop(key, None)
+                raise
             if image_trace is not None:
                 image_trace["generate_api_ms"] = int(
                     (time.time() - generate_started_at) * 1000
