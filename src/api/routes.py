@@ -851,6 +851,106 @@ async def list_model_aliases(api_key: str = Depends(verify_api_key_flexible)):
     return {"object": "list", "data": alias_models}
 
 
+def _parse_results_since(since: Optional[str], minutes: int) -> str:
+    """把 since（unix 秒 / ISO8601，无时区按 UTC）或 minutes 转为日志表的 UTC 时间格式。"""
+    from datetime import datetime, timedelta, timezone
+
+    if since:
+        raw = since.strip()
+        try:
+            moment = datetime.fromtimestamp(float(raw), tz=timezone.utc)
+        except ValueError:
+            try:
+                moment = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            except ValueError:
+                raise HTTPException(
+                    status_code=400,
+                    detail="since 需为 unix 秒或 ISO8601 时间，如 2026-10-24T15:00:00Z",
+                )
+            if moment.tzinfo is None:
+                moment = moment.replace(tzinfo=timezone.utc)
+    else:
+        moment = datetime.now(timezone.utc) - timedelta(minutes=minutes)
+    return moment.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _to_result_item(log: Dict[str, Any]) -> Dict[str, Any]:
+    def _load(raw):
+        try:
+            return json.loads(raw) if raw else {}
+        except (TypeError, ValueError):
+            return {}
+
+    request_body = _load(log.get("request_body"))
+    response_body = _load(log.get("response_body"))
+    code = log.get("status_code")
+    if code == 200:
+        status = "success"
+    elif code == 102:
+        status = "processing"
+    elif code == 499:
+        status = "cancelled"
+    else:
+        status = "failed"
+
+    def _iso(value):
+        return f"{str(value).replace(' ', 'T')}Z" if value else None
+
+    performance = response_body.get("performance") or {}
+    image_perf = performance.get("image_generation") or {}
+    return {
+        "id": log.get("id"),
+        "status": status,
+        "status_text": log.get("status_text") or "",
+        "progress": log.get("progress") or 0,
+        "model": request_body.get("model") or response_body.get("model"),
+        "prompt": request_body.get("prompt") or response_body.get("prompt") or "",
+        "input_image_count": image_perf.get("input_image_count"),
+        "created_at": _iso(log.get("created_at")),
+        "updated_at": _iso(log.get("updated_at")),
+        "duration_seconds": round(float(log.get("duration") or 0), 1),
+        "url": response_body.get("url"),
+        "generated_assets": response_body.get("generated_assets"),
+        "error": response_body.get("error") or response_body.get("error_message"),
+    }
+
+
+@router.get("/v1/results")
+async def list_recent_results(
+    since: Optional[str] = Query(None, description="起始时间：unix 秒或 ISO8601（无时区按 UTC）"),
+    minutes: int = Query(1440, ge=1, le=7 * 1440, description="未给 since 时回看的分钟数"),
+    q: Optional[str] = Query(None, description="prompt 子串（不区分大小写）"),
+    model: Optional[str] = Query(None),
+    status: Optional[str] = Query(None, description="success / failed / processing / cancelled"),
+    limit: int = Query(20, ge=1, le=100),
+    api_key: str = Depends(verify_api_key_flexible),
+):
+    """本地补丁：找回客户端超时断开（如 Cloudflare 524）但服务端已完成的生成结果。
+
+    数据来自请求日志；图片文件按缓存时长保留（cache_timeout），过期后 url 将失效。
+    """
+    handler = _ensure_generation_handler()
+    since_utc = _parse_results_since(since, minutes)
+    # 先多取一些再在内存里过滤 prompt/model/status
+    logs = await handler.db.get_recent_result_logs(since=since_utc, limit=1000)
+
+    needle = (q or "").strip().lower()
+    items = []
+    for log in logs:
+        item = _to_result_item(log)
+        if needle and needle not in item["prompt"].lower():
+            continue
+        if model and item["model"] != model:
+            continue
+        if status and item["status"] != status:
+            continue
+        items.append(item)
+        if len(items) >= limit:
+            break
+
+    return {"object": "list", "since": f"{since_utc.replace(' ', 'T')}Z", "data": items}
+
+
 @router.get("/v1beta/models")
 @router.get("/models")
 async def list_gemini_models(api_key: str = Depends(verify_api_key_flexible)):

@@ -1983,6 +1983,31 @@ class Database:
             row = await cursor.fetchone()
             return dict(row) if row else None
 
+    async def get_recent_result_logs(
+        self, since: Optional[str] = None, limit: int = 200
+    ) -> List[Dict[str, Any]]:
+        """本地补丁：按时间倒序取请求日志（含 payload），供 /v1/results 找回断连任务的结果。
+
+        since 为 UTC 'YYYY-MM-DD HH:MM:SS'，与 created_at 的存储格式一致。
+        """
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            where = "WHERE created_at >= ?" if since else ""
+            params: tuple = (since, limit) if since else (limit,)
+            cursor = await db.execute(
+                f"""
+                SELECT id, operation, request_body, response_body, status_code,
+                       duration, status_text, progress, created_at, updated_at
+                FROM request_logs
+                {where}
+                ORDER BY id DESC
+                LIMIT ?
+            """,
+                params,
+            )
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
     async def clear_all_logs(self):
         """Clear all request logs"""
         async with self._connect(write=True) as db:
