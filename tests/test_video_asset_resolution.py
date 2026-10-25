@@ -44,6 +44,18 @@ class VideoAssetResolutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(passed_id, MEDIA_NAME)
         self.assertEqual(resolved["video_url"], VIDEO_URL)
         self.assertEqual(resolved["video_media_id"], GENERATION_ID)
+        self.assertEqual(resolved["media_name"], MEDIA_NAME)
+
+    async def test_reuses_signed_url_and_preserves_media_name(self):
+        operation = _operation()
+        operation["operation"]["metadata"]["video"]["fifeUrl"] = VIDEO_URL
+
+        resolved = await self.handler._resolve_video_asset(MagicMock(), operation)
+
+        self.handler.flow_client.get_media_url_redirect.assert_not_awaited()
+        self.assertEqual(resolved["video_url"], VIDEO_URL)
+        self.assertEqual(resolved["video_media_id"], GENERATION_ID)
+        self.assertEqual(resolved["media_name"], MEDIA_NAME)
 
     async def test_falls_back_to_operation_name_when_metadata_missing(self):
         operation = _operation()
@@ -55,6 +67,7 @@ class VideoAssetResolutionTests(unittest.IsolatedAsyncioTestCase):
         _, passed_id = self.handler.flow_client.get_media_url_redirect.await_args.args
         self.assertEqual(passed_id, GENERATION_ID)
         self.assertEqual(resolved["video_url"], VIDEO_URL)
+        self.assertEqual(resolved["media_name"], MEDIA_NAME)
 
 
 if __name__ == "__main__":

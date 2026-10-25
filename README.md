@@ -16,13 +16,13 @@
 <table>
 <tr>
 <td width="180" align="center" valign="middle">
-  <a href="https://go.apimart.ai/gh-flow2api">
-    <img src="static/sponsors/apimart-banner.jpg" alt="APIMart" width="150">
+  <a href="https://useapi.net/docs/articles/google-flow-api-zh?utm_source=flow2api&utm_medium=referral&utm_campaign=flow2api-sponsor">
+    <img src="https://useapi.net/assets/images/sponsor/useapi-banner.png" alt="useapi.net" width="150">
   </a>
 </td>
 <td valign="top">
-  感谢 <strong>APIMart</strong> 赞助了本项目！APIMart 是专注 AI 图片/视频生成的低价 API 平台，GPT-Image-2 低至 \$0.006/张，1 美元可出图 160+ 张。图片、视频一套异步 API 通吃，提交任务拿 ID、回调取结果，跑批万张不超时、换模型不改代码。按量付费、无月费，通过<a href="https://go.apimart.ai/gh-flow2api">此注册链接</a>注册即可开用。<br><br>
-  Thanks to <strong>APIMart</strong> for sponsoring this project! APIMart is a low-cost API platform for AI image &amp; video generation — GPT-Image-2 from \$0.006/image, 160+ images per dollar. One async API covers both image and video: submit a task, get an ID, fetch results via polling or callback. Batch tens of thousands of images without timeouts, switch models without changing code. Pay-as-you-go with no monthly fee — <a href="https://go.apimart.ai/gh-flow2api">sign up here</a> to get started.
+  感谢 <strong>useapi.net</strong> 赞助了本项目！<strong>一个订阅，全部 API</strong>：useapi.net 为你自己的 Google 账号提供托管 API：<strong>Google Flow</strong>（Veo 3.1、带原生音频的 Omni 1.1 Flash、Nano Banana Pro）、<strong>Google Vids</strong>（Gemini Omni 1.1 Flash 带配音数字人，<strong>无需验证码</strong>，额度与 Flow 分开，同一账号同时使用 Flow 和 Vids，Omni 产能约翻倍）、<strong>Google Flow Music</strong>（Lyria 3.5 整首歌曲）和 <strong>Gemini Notebook</strong>（NotebookLM）。新上线 <strong>Meta Muse</strong>（muse.ai）：用你自己的 Muse 账号生成图片和约 10 秒带台词配音的视频，免费账号可用。无需自己部署。同一订阅还包含 Dreamina、可灵 Kling、PixVerse、海螺 MiniMax、Mureka、Runway 等 API，每月固定 $15。<a href="https://useapi.net/docs/articles/google-flow-api-zh?utm_source=flow2api&utm_medium=referral&utm_campaign=flow2api-sponsor">Flow 中文教程</a> · <a href="https://useapi.net/docs/articles/google-vids-api-zh?utm_source=flow2api&utm_medium=referral&utm_campaign=flow2api-sponsor">Vids 中文教程</a> · <a href="https://useapi.net/docs/articles/muse-api-zh?utm_source=flow2api&utm_medium=referral&utm_campaign=flow2api-sponsor">Muse 中文教程</a> · <a href="https://buy.stripe.com/8x2aEX4Bd8Vh9PMg4qeUU03?client_reference_id=flow2api">订阅</a><br><br>
+  Thanks to <strong>useapi.net</strong> for sponsoring this project! <strong>One subscription, every API</strong>: useapi.net runs hosted APIs on your own Google account: <strong>Google Flow</strong> (Veo 3.1, audio-native Omni 1.1 Flash, Nano Banana Pro), <strong>Google Vids</strong> (Gemini Omni 1.1 Flash with voiced avatars, <strong>no captcha</strong>, an allowance separate from Flow, so using both on one account roughly doubles your Omni capacity), <strong>Google Flow Music</strong> (full songs with Lyria 3.5) and <strong>Gemini Notebook</strong> (NotebookLM). New: <strong>Meta Muse</strong> (muse.ai): images and about 10-second videos with spoken dialogue on your own Muse account, free plan included. Nothing to self-host. The same flat $15/month also covers Dreamina, Kling, PixVerse, MiniMax, Mureka, Runway and more. <a href="https://useapi.net/docs/api-google-flow-v1?utm_source=flow2api&utm_medium=referral&utm_campaign=flow2api-sponsor">Flow docs</a> · <a href="https://useapi.net/docs/api-google-vids-v1?utm_source=flow2api&utm_medium=referral&utm_campaign=flow2api-sponsor">Vids docs</a> · <a href="https://useapi.net/docs/api-muse-v1?utm_source=flow2api&utm_medium=referral&utm_campaign=flow2api-sponsor">Muse docs</a> · <a href="https://buy.stripe.com/8x2aEX4Bd8Vh9PMg4qeUU03?client_reference_id=flow2api">Subscribe</a>
 </td>
 </tr>
 </table>
@@ -30,13 +30,13 @@
 <table>
 <tr>
 <td width="180" align="center" valign="middle">
-  <a href="https://useapi.net/docs/articles/google-flow-api-zh?utm_source=flow2api&utm_medium=referral&utm_campaign=flow2api-sponsor">
-    <img src="https://useapi.net/assets/images/sponsor/useapi-banner.png" alt="useapi.net" width="150">
+  <a href="https://proxylane.dev/?utm_source=flow2api&utm_medium=partnership&utm_campaign=flow2api_sponsor_202610&utm_content=github_readme">
+    <img src="static/sponsors/proxylane-flow2api.png" alt="ProxyLane" width="150">
   </a>
 </td>
 <td valign="top">
-  感谢 <strong>useapi.net</strong> 赞助了本项目！<strong>一个订阅，全部 API</strong>：useapi.net 为你自己的 Google 账号提供托管 API：<strong>Google Flow</strong>（Veo 3.1、带原生音频的 Omni 1.1 Flash、Nano Banana Pro）、<strong>Google Flow Music</strong>（Lyria 3.5 整首歌曲生成，含翻唱、续写、分轨）和 <strong>Gemini Notebook</strong>（NotebookLM）。生成消耗你 Google AI 订阅里的额度，已适配 flow.google.com，reCAPTCHA 服务端处理，无需自己部署。同一订阅还包含 Dreamina、可灵 Kling、PixVerse、海螺 MiniMax、Mureka、Runway 等 API，每月固定 $15。<a href="https://useapi.net/docs/articles/google-flow-api-zh?utm_source=flow2api&utm_medium=referral&utm_campaign=flow2api-sponsor">中文教程</a> · <a href="https://buy.stripe.com/8x2aEX4Bd8Vh9PMg4qeUU03?client_reference_id=flow2api">订阅</a><br><br>
-  Thanks to <strong>useapi.net</strong> for sponsoring this project! <strong>One subscription, every API</strong>: useapi.net runs hosted APIs on your own Google account: <strong>Google Flow</strong> (Veo 3.1, audio-native Omni 1.1 Flash, Nano Banana Pro), <strong>Google Flow Music</strong> (full songs with Lyria 3.5, plus cover, extend and stems) and <strong>Gemini Notebook</strong> (NotebookLM). Generation uses your own Google AI plan, works with flow.google.com, and reCAPTCHA is handled server-side. The same flat $15/month also covers Dreamina, Kling, PixVerse, MiniMax, Mureka, Runway and more. <a href="https://useapi.net/docs/api-google-flow-v1?utm_source=flow2api&utm_medium=referral&utm_campaign=flow2api-sponsor">Docs</a> · <a href="https://buy.stripe.com/8x2aEX4Bd8Vh9PMg4qeUU03?client_reference_id=flow2api">Subscribe</a>
+  感谢 <strong>ProxyLane</strong> 赞助了本项目！ProxyLane 是住宅代理服务，覆盖 195 个国家，95%+ IP 获 Scamalytics 低风险评级，支持 HTTP / SOCKS5 和账号密码认证。在 Token 的「协议代理」「打码代理」或全局「请求代理地址」里填入代理，用户名中写上城市和会话名，每个 Token 最长 72 小时使用同一个住宅 IP，换 IP 也留在同一城市。中文界面，支持 USDT 付款，首次购买使用优惠码 <strong>FLOW2API30</strong> 享 7 折，通过<a href="https://proxylane.dev/?utm_source=flow2api&utm_medium=partnership&utm_campaign=flow2api_sponsor_202610&utm_content=github_readme">此链接</a>注册即可。<br><br>
+  Thanks to <strong>ProxyLane</strong> for sponsoring this project! ProxyLane is a residential proxy service in 195 countries, with 95%+ of IPs rated low risk by Scamalytics and HTTP / SOCKS5 with username and password. Put the proxy into a Token's protocol or captcha proxy, or into the global request proxy, with a city and a session name in the username: each Token keeps one residential IP for up to 72 hours, and a replacement IP stays in the same city. New customers get 30% off the first purchase with code <strong>FLOW2API30</strong>. <a href="https://proxylane.dev/?utm_source=flow2api&utm_medium=partnership&utm_campaign=flow2api_sponsor_202610&utm_content=github_readme_en">Sign up here</a> to get started.
 </td>
 </tr>
 </table>
@@ -46,7 +46,7 @@
 - 🎨 **文生图** / **图生图**
 - 🎬 **文生视频** / **图生视频**
 - 🎞️ **首尾帧视频**
-- 🔄 **AT/ST自动刷新** - AT 过期自动刷新，ST 过期时自动通过浏览器更新（personal 模式）
+- 🔄 **Cookie 自动刷新** - 定时刷新完整 Google/Flow Cookie 并验证登录态，支持 browser/personal 浏览器兜底；登录失效后需重新同步 Cookie
 - 📊 **余额显示** - 实时查询和显示 VideoFX Credits
 - 🚀 **负载均衡** - 多 Token 轮询和并发控制
 - 🌐 **代理支持** - 支持 HTTP/SOCKS5 代理
@@ -66,8 +66,9 @@
   - 注册 [YesCaptcha](https://yescaptcha.com/i/13Xd8K) 并获取 API Key，填入系统配置页面的 `YesCaptcha API 密钥`。
   - 注册 [CapSolver](https://dashboard.capsolver.com/passport/register?inviteCode=z95yVf1HvixI) 并获取 API Key，填入系统配置页面的 `CapSolver API 密钥`。
   - 注册 [Captcha.run](https://captcha.run/sso?inviter=36179602-dbd1-4227-8ec8-98f8c0170c59) 并获取 API Key，填入系统配置页面的 `Captcha.run API 密钥`。
+  - 注册 [2Captcha](https://2captcha.com/auth/register/?from=24953866) 并获取 API Key，填入系统配置页面的 `2Captcha API 密钥`。
 - YesCaptcha 支持在管理页切换 `type`：`RecaptchaV3TaskProxyless`、`RecaptchaV3TaskProxylessM1`、`RecaptchaV3TaskProxylessM1S7`、`RecaptchaV3TaskProxylessM1S9`；当前默认推荐 `M1S9`，S7/S9 会强制提交 `minScore` 0.7/0.9。
-- 默认 `docker-compose.yml` 建议搭配第三方打码（yescaptcha/captcharun/capmonster/ezcaptcha/capsolver）。
+- 默认 `docker-compose.yml` 建议搭配第三方打码（yescaptcha/captcharun/twocaptcha/capmonster/ezcaptcha/capsolver）。
 如需 Docker 内有头打码（browser/personal），请使用下方 `docker-compose.headed.yml`。
 
 - 自动推送新版 Flow 登录态的浏览器扩展：[Flow2API-Token-Updater](https://github.com/TheSmallHanCat/Flow2API-Token-Updater)。
@@ -169,7 +170,7 @@ Prometheus 可直接抓 `/metrics`。如果部署到 Kubernetes，建议只在�
 
 ### 图片生成
 
-当前 `/v1/models` 与 Gemini `/models` 公开以下 15 个图片模型。旧图片名称继续兼容，但不再出现在模型列表中。
+当前 `/v1/models` 与 Gemini `/models` 公开 Nano Banana 2.1 和 Nano Banana 2 Lite 两个图片系列，共 30 个比例与分辨率变体。已有 `gemini-3.1-flash-image-*` 名称继续保留，调用新版 Nano Banana 2.1（`BELUGA`）。旧 Pro 名称 `gemini-3.0-pro-image-*` 继续调用 Nano Banana Pro（`GEM_PIX_2`），但不出现在模型列表中。旧 Imagen 模型已停止支持；模型不存在时不会回退到旧上游字段。
 
 | 当前公开名称 | 分辨率 | 比例 |
 |---|---:|---:|
@@ -188,6 +189,10 @@ Prometheus 可直接抓 `/metrics`。如果部署到 Kubernetes，建议只在�
 | `gemini-3.1-flash-image-square-4k` | 4K | 方图 |
 | `gemini-3.1-flash-image-four-three-4k` | 4K | 横屏 4:3 |
 | `gemini-3.1-flash-image-three-four-4k` | 4K | 竖屏 3:4 |
+
+Nano Banana 2 Lite 使用 `gemini-3.1-flash-lite-image-*`，比例及分辨率后缀与上表一致，例如 `gemini-3.1-flash-lite-image-landscape`、`gemini-3.1-flash-lite-image-portrait-2k`、`gemini-3.1-flash-lite-image-square-4k`。也支持简化名称 `gemini-3.1-flash-lite-image` 搭配 `aspectRatio` / `imageSize` 参数。
+
+2K/4K 变体通过生成后的高清放大实现，不代表 Lite 原生输出这些分辨率。主程序通过图片 RPC 明确提交模型、比例和参考图；浏览器打码与第三方打码均只提供验证码。`browser` / `personal` 模式不需要第三方打码密钥，图片、上传、放大及视频请求按所需 action 获取验证码。Lite 不会自动回退到其他图片模型。
 
 ### 视频生成
 

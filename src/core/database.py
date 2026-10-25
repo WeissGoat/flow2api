@@ -262,6 +262,8 @@ class Database:
             yescaptcha_api_key = ""
             yescaptcha_base_url = "https://api.yescaptcha.com"
             yescaptcha_task_type = DEFAULT_YESCAPTCHA_TASK_TYPE
+            twocaptcha_api_key = ""
+            twocaptcha_base_url = "https://api.2captcha.com"
             remote_browser_base_url = ""
             remote_browser_api_key = ""
             remote_browser_timeout = 60
@@ -280,6 +282,10 @@ class Database:
                 )
                 yescaptcha_task_type = normalize_yescaptcha_task_type(
                     captcha_config.get("yescaptcha_task_type")
+                )
+                twocaptcha_api_key = captcha_config.get("twocaptcha_api_key", "")
+                twocaptcha_base_url = captcha_config.get(
+                    "twocaptcha_base_url", "https://api.2captcha.com"
                 )
                 remote_browser_base_url = captcha_config.get(
                     "remote_browser_base_url", ""
@@ -344,9 +350,9 @@ class Database:
                     remote_browser_base_url, remote_browser_api_key, remote_browser_timeout,
                     browser_count, personal_project_pool_size,
                     personal_max_resident_tabs, browser_personal_fresh_restart_every_n_solves,
-                    personal_idle_tab_ttl_seconds
+                    personal_idle_tab_ttl_seconds, twocaptcha_api_key, twocaptcha_base_url
                 )
-                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
                 (
                 captcha_method,
@@ -361,8 +367,19 @@ class Database:
                 personal_max_resident_tabs,
                 browser_personal_fresh_restart_every_n_solves,
                 personal_idle_tab_ttl_seconds,
+                twocaptcha_api_key,
+                twocaptcha_base_url,
                 ),
             )
+
+        # 清理历史版本的邮箱不匹配报错记录（现在邮箱按 Flow 页面自动更正）
+        try:
+            await db.execute(
+                "UPDATE tokens SET last_st_refresh_result = '' "
+                "WHERE last_st_refresh_result LIKE '%登录账号与当前%'"
+            )
+        except Exception:
+            pass
 
         # Ensure plugin_config has a row
         cursor = await db.execute("SELECT COUNT(*) FROM plugin_config")
@@ -379,7 +396,7 @@ class Database:
         if count[0] == 0:
             await db.execute("""
                 INSERT INTO token_refresh_config (id, enabled, refresh_interval_minutes)
-                VALUES (1, 1, 120)
+                VALUES (1, 1, 30)
             """)
 
     async def check_and_migrate_db(self, config_dict: dict = None):
@@ -459,6 +476,8 @@ class Database:
                         capsolver_base_url TEXT DEFAULT 'https://api.capsolver.com',
                         captcharun_api_key TEXT DEFAULT '',
                         captcharun_base_url TEXT DEFAULT 'https://api.captcha-run.com',
+                        twocaptcha_api_key TEXT DEFAULT '',
+                        twocaptcha_base_url TEXT DEFAULT 'https://api.2captcha.com',
                         remote_browser_base_url TEXT DEFAULT '',
                         remote_browser_api_key TEXT DEFAULT '',
                         remote_browser_timeout INTEGER DEFAULT 60,
@@ -495,7 +514,7 @@ class Database:
                     CREATE TABLE token_refresh_config (
                         id INTEGER PRIMARY KEY DEFAULT 1,
                         enabled BOOLEAN DEFAULT 1,
-                        refresh_interval_minutes INTEGER DEFAULT 120,
+                        refresh_interval_minutes INTEGER DEFAULT 30,
                         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )
                 """)
@@ -522,7 +541,7 @@ class Database:
                     ("login_password", "TEXT DEFAULT ''"),  # 预留
                     ("proxy_url", "TEXT DEFAULT ''"),  # 协议刷新代理
                     ("auto_refresh_enabled", "BOOLEAN DEFAULT 1"),
-                    ("refresh_interval_minutes", "INTEGER DEFAULT 120"),
+                    ("refresh_interval_minutes", "INTEGER DEFAULT 30"),
                     ("last_st_refresh_at", "TIMESTAMP"),
                     ("last_st_refresh_result", "TEXT DEFAULT ''"),
                     ("ban_reason", "TEXT"),  # 禁用原因
@@ -609,6 +628,8 @@ class Database:
                     ("ezcaptcha_base_url", "TEXT DEFAULT 'https://api.ez-captcha.com'"),
                     ("capsolver_api_key", "TEXT DEFAULT ''"),
                     ("capsolver_base_url", "TEXT DEFAULT 'https://api.capsolver.com'"),
+                    ("twocaptcha_api_key", "TEXT DEFAULT ''"),
+                    ("twocaptcha_base_url", "TEXT DEFAULT 'https://api.2captcha.com'"),
                     ("captcharun_api_key", "TEXT DEFAULT ''"),
                     (
                         "captcharun_base_url",
@@ -673,7 +694,7 @@ class Database:
             if await self._table_exists(db, "token_refresh_config"):
                 token_refresh_columns_to_add = [
                     ("enabled", "BOOLEAN DEFAULT 1"),
-                    ("refresh_interval_minutes", "INTEGER DEFAULT 120"),
+                    ("refresh_interval_minutes", "INTEGER DEFAULT 30"),
                     ("updated_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
                 ]
 
@@ -758,7 +779,7 @@ class Database:
                     login_password TEXT DEFAULT '',
                     proxy_url TEXT DEFAULT '',
                     auto_refresh_enabled BOOLEAN DEFAULT 1,
-                    refresh_interval_minutes INTEGER DEFAULT 120,
+                    refresh_interval_minutes INTEGER DEFAULT 30,
                     last_st_refresh_at TIMESTAMP,
                     last_st_refresh_result TEXT DEFAULT '',
                     ban_reason TEXT,
@@ -923,6 +944,8 @@ class Database:
                     capsolver_base_url TEXT DEFAULT 'https://api.capsolver.com',
                     captcharun_api_key TEXT DEFAULT '',
                     captcharun_base_url TEXT DEFAULT 'https://api.captcha-run.com',
+                    twocaptcha_api_key TEXT DEFAULT '',
+                    twocaptcha_base_url TEXT DEFAULT 'https://api.2captcha.com',
                     remote_browser_base_url TEXT DEFAULT '',
                     remote_browser_api_key TEXT DEFAULT '',
                     remote_browser_timeout INTEGER DEFAULT 60,
@@ -956,7 +979,7 @@ class Database:
                 CREATE TABLE IF NOT EXISTS token_refresh_config (
                     id INTEGER PRIMARY KEY DEFAULT 1,
                     enabled BOOLEAN DEFAULT 1,
-                    refresh_interval_minutes INTEGER DEFAULT 120,
+                    refresh_interval_minutes INTEGER DEFAULT 30,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
@@ -1330,6 +1353,26 @@ class Database:
                 query = f"UPDATE tokens SET {', '.join(updates)} WHERE id = ?"
                 await db.execute(query, params)
                 await db.commit()
+
+    async def update_token_if_cookie_matches(
+        self, token_id: int, expected_cookies: str, **kwargs
+    ) -> bool:
+        """Save a refresh without overwriting a newer account Cookie push."""
+        allowed = {
+            "google_cookies", "st", "at", "at_expires", "credits",
+            "user_paygate_tier", "last_st_refresh_at", "last_st_refresh_result",
+            "email", "login_account", "name",
+        }
+        if not kwargs or not set(kwargs).issubset(allowed):
+            raise ValueError("Invalid cookie refresh fields")
+        async with self._connect(write=True) as db:
+            assignments = ", ".join(f"{key} = ?" for key in kwargs)
+            cursor = await db.execute(
+                f"UPDATE tokens SET {assignments} WHERE id = ? AND COALESCE(google_cookies, '') = ?",
+                [*kwargs.values(), token_id, expected_cookies or ""],
+            )
+            await db.commit()
+            return cursor.rowcount > 0
 
     async def delete_token(self, token_id: int):
         """Delete token and related data"""
@@ -2094,6 +2137,8 @@ class Database:
             config.set_capsolver_base_url(captcha_config.capsolver_base_url)
             config.set_captcharun_api_key(captcha_config.captcharun_api_key)
             config.set_captcharun_base_url(captcha_config.captcharun_base_url)
+            config.set_twocaptcha_api_key(captcha_config.twocaptcha_api_key)
+            config.set_twocaptcha_base_url(captcha_config.twocaptcha_base_url)
             config.set_remote_browser_base_url(captcha_config.remote_browser_base_url)
             config.set_remote_browser_api_key(captcha_config.remote_browser_api_key)
             config.set_remote_browser_timeout(captcha_config.remote_browser_timeout)
@@ -2278,6 +2323,8 @@ class Database:
         capsolver_base_url: str = None,
         captcharun_api_key: str = None,
         captcharun_base_url: str = None,
+        twocaptcha_api_key: str = None,
+        twocaptcha_base_url: str = None,
         remote_browser_base_url: str = None,
         remote_browser_api_key: str = None,
         remote_browser_timeout: int = None,
@@ -2605,6 +2652,19 @@ class Database:
                     ),
                 )
 
+            # Keep the new provider update in the same transaction as the existing fields.
+            previous_captcha = dict(row) if row else {}
+            await db.execute(
+                "UPDATE captcha_config SET twocaptcha_api_key = ?, twocaptcha_base_url = ? WHERE id = 1",
+                (
+                    twocaptcha_api_key
+                    if twocaptcha_api_key is not None
+                    else previous_captcha.get("twocaptcha_api_key", ""),
+                    twocaptcha_base_url
+                    if twocaptcha_base_url is not None
+                    else previous_captcha.get("twocaptcha_base_url", "https://api.2captcha.com"),
+                ),
+            )
             await db.commit()
 
     # Plugin config operations
@@ -2657,6 +2717,19 @@ class Database:
                 return TokenRefreshConfig(**dict(row))
             return TokenRefreshConfig()
 
+    async def update_all_tokens_refresh_interval(self, minutes: int) -> int:
+        """Apply one Cookie refresh interval to every account."""
+        try:
+            normalized = max(1, int(minutes))
+        except Exception:
+            raise ValueError("refresh_interval_minutes must be a positive integer")
+        async with self._connect(write=True) as db:
+            cursor = await db.execute(
+                "UPDATE tokens SET refresh_interval_minutes = ?", (normalized,)
+            )
+            await db.commit()
+            return cursor.rowcount
+
     async def update_token_refresh_config(
         self,
         enabled: Optional[bool] = None,
@@ -2675,10 +2748,10 @@ class Database:
                 new_interval = int(
                     refresh_interval_minutes
                     if refresh_interval_minutes is not None
-                    else current.get("refresh_interval_minutes", 120)
+                    else current.get("refresh_interval_minutes", 30)
                 )
             except Exception:
-                new_interval = 120
+                new_interval = 30
             new_interval = max(1, new_interval)
 
             if row:

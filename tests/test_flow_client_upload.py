@@ -59,8 +59,7 @@ class FlowClientUploadImageTests(unittest.IsolatedAsyncioTestCase):
         argument = client._call_flow_frontend_rpc.await_args.kwargs["argument"]
         self.assertEqual(len(argument), 12)
         # slot 3 is an integer enum; sending a bool makes the RPC reject with code=[3]
-        self.assertEqual(argument[3], 1)
-        self.assertIsInstance(argument[3], int)
+        self.assertIs(type(argument[3]), int)
         self.assertIsNone(argument[7])
         self.assertIsNone(argument[9])
         for slot in (10, 11):

@@ -15,7 +15,7 @@ class FlowClientImageGenerationArgumentTests(unittest.TestCase):
         argument = self.client._build_frontend_image_generation_argument(
             project_id=PROJECT_ID,
             prompt="换成针织开衫",
-            model_name="NARWHAL",
+            model_name="BELUGA",
             aspect_ratio="IMAGE_ASPECT_RATIO_LANDSCAPE",
             recaptcha_token="recaptcha-token",
             session_id="session-id",
@@ -33,7 +33,7 @@ class FlowClientImageGenerationArgumentTests(unittest.TestCase):
         argument = self.client._build_frontend_image_generation_argument(
             project_id=PROJECT_ID,
             prompt="一只红苹果",
-            model_name="NARWHAL",
+            model_name="BELUGA",
             aspect_ratio="IMAGE_ASPECT_RATIO_LANDSCAPE",
             recaptcha_token="recaptcha-token",
             session_id="session-id",
@@ -42,6 +42,27 @@ class FlowClientImageGenerationArgumentTests(unittest.TestCase):
         request = argument[1][0]
         self.assertIsNone(request[2])
         self.assertIsNone(request[9])
+
+    def test_image_requests_follow_fourteen_slot_layout(self):
+        for model_name in ("BELUGA", "HARBOR_SEAL", "GEM_PIX_2"):
+            for image_inputs in (None, [{"name": MEDIA_ID}]):
+                with self.subTest(model=model_name, references=bool(image_inputs)):
+                    argument = self.client._build_frontend_image_generation_argument(
+                        project_id=PROJECT_ID,
+                        prompt="an apple",
+                        model_name=model_name,
+                        aspect_ratio="IMAGE_ASPECT_RATIO_LANDSCAPE",
+                        recaptcha_token="recaptcha-token",
+                        session_id="session-id",
+                        image_inputs=image_inputs,
+                    )
+                    request = argument[1][0]
+                    self.assertEqual(len(request), 14)
+                    self.assertEqual(request[5], model_name)
+                    self.assertEqual(request[9:12], [None, None, None])
+                    self.assertEqual(request[12], "session-id")
+                    self.assertRegex(request[13], r"^[0-9A-F-]{36}$")
+                    self.assertEqual(argument[4], ["session-id"])
 
 
 if __name__ == "__main__":

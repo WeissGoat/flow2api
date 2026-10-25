@@ -22,10 +22,9 @@ from ..core.logger import debug_logger
 IMAGE_BASE_MODELS = {
     # Gemini 3.0 Pro (GEM_PIX_2)
     "gemini-3.0-pro-image": "gemini-3.0-pro-image",
-    # Gemini 3.1 Flash (NARWHAL)
+    # Nano Banana 2.1, with the existing Gemini 3.1 alias retained.
     "gemini-3.1-flash-image": "gemini-3.1-flash-image",
-    # Imagen 4.0 (IMAGEN_3_5)
-    "imagen-4.0-generate-preview": "imagen-4.0-generate-preview",
+    "gemini-3.1-flash-lite-image": "gemini-3.1-flash-lite-image",
 }
 
 # ──────────────────────────────────────────────
@@ -70,14 +69,16 @@ MODEL_SUPPORTED_ASPECTS = {
         "four-three",
         "three-four",
     ],
-    "imagen-4.0-generate-preview": ["landscape", "portrait"],
+    "gemini-3.1-flash-lite-image": [
+        "landscape", "portrait", "square", "four-three", "three-four",
+    ],
 }
 
 # 每个基础模型支持的 imageSize（分辨率）列表
 MODEL_SUPPORTED_SIZES = {
     "gemini-3.0-pro-image": ["2k", "4k"],
     "gemini-3.1-flash-image": ["2k", "4k"],
-    "imagen-4.0-generate-preview": [],  # 不支持放大
+    "gemini-3.1-flash-lite-image": ["2k", "4k"],
 }
 
 # imageSize 归一化映射

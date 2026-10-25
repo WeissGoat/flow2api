@@ -88,9 +88,24 @@ def _normalize_same_site(value: Any) -> Optional[str]:
     return None
 
 
+def is_partitioned_cookie(cookie: Any) -> bool:
+    """Detect browser partition scope that an ordinary Cookie jar cannot retain."""
+    keys = ("partitionKey", "partition_key")
+    flags = ("partitionKeyOpaque", "partition_key_opaque", "partitioned")
+    if isinstance(cookie, dict):
+        return any(cookie.get(key) is not None for key in keys) or any(
+            bool(cookie.get(flag)) for flag in flags
+        )
+    return any(getattr(cookie, key, None) is not None for key in keys) or any(
+        bool(getattr(cookie, flag, False)) for flag in flags
+    )
+
+
 def _build_cookie_from_mapping(
     raw_cookie: Dict[str, Any], default_url: str
 ) -> Optional[Dict[str, Any]]:
+    if is_partitioned_cookie(raw_cookie):
+        return None
     name = str(raw_cookie.get("name") or "").strip()
     if not name:
         return None
@@ -103,8 +118,15 @@ def _build_cookie_from_mapping(
     path = str(raw_cookie.get("path") or "/").strip() or "/"
     if url:
         cookie["url"] = url
+        if raw_cookie.get("path"):
+            cookie["path"] = path
     elif domain:
-        cookie["domain"] = domain
+        host_only = raw_cookie.get("hostOnly")
+        if host_only is True or (host_only is None and not domain.startswith(".")):
+            scheme = "https" if raw_cookie.get("secure", True) else "http"
+            cookie["url"] = f"{scheme}://{domain.lstrip('.')}/"
+        else:
+            cookie["domain"] = domain
         cookie["path"] = path
     else:
         cookie["url"] = default_url
@@ -126,8 +148,8 @@ def _build_cookie_from_mapping(
     if name.startswith("__Host-"):
         cookie.pop("domain", None)
         cookie["path"] = "/"
-        if "url" not in cookie:
-            cookie["url"] = default_url
+        origin = urlparse(cookie.get("url") or (f"https://{domain.lstrip('.')}/" if domain else default_url))
+        cookie["url"] = f"https://{origin.netloc}/" if origin.netloc else default_url
     return cookie
 
 
@@ -156,7 +178,7 @@ def parse_browser_cookie_payload(
                     cookies.append(normalized_item)
             return cookies
     cookies = []
-    for chunk in normalized.split(";"):
+    for chunk in normalized.replace("\n", ";").split(";"):
         segment = chunk.strip()
         if not segment or "=" not in segment:
             continue
@@ -343,6 +365,8 @@ def _cookie_path_matches(request_path: str, cookie_path: str) -> bool:
 
 
 def _cookie_mapping_matches_url(cookie: Dict[str, Any], target_url: str) -> bool:
+    if is_partitioned_cookie(cookie):
+        return False
     target = urlparse(target_url)
     target_host = str(target.hostname or "").strip().lower()
     target_path = target.path or "/"
@@ -380,15 +404,6 @@ def _cookie_mapping_matches_url(cookie: Dict[str, Any], target_url: str) -> bool
         except (TypeError, ValueError):
             pass
 
-    partition_key = cookie.get("partitionKey")
-    if isinstance(partition_key, dict):
-        top_level_site = str(partition_key.get("topLevelSite") or "").strip()
-        if top_level_site:
-            partition_host = str(urlparse(top_level_site).hostname or "").lower()
-            if partition_host and not (
-                partition_host == "google.com" or partition_host.endswith(".google.com")
-            ):
-                return False
     return True
 
 

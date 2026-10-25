@@ -25,17 +25,23 @@ import shutil
 import tempfile
 import subprocess
 import types
+import uuid
 from pathlib import Path
 from typing import Optional, Dict, Any, Iterable
-from urllib.parse import urljoin, urlparse, urlunparse
+from urllib.parse import parse_qsl, urljoin, urlparse, urlunparse
 
 from curl_cffi.requests import AsyncSession
 
 from ..core.logger import debug_logger
 from ..core.config import config
+from .recaptcha_runtime import (
+    TRUSTED_RECAPTCHA_HOOK_SOURCE as PERSONAL_TRUSTED_RECAPTCHA_HOOK_SOURCE,
+    build_recaptcha_execute_script,
+)
 from .browser_cookie_utils import (
     build_browser_cookie_targets,
     build_cookie_signature,
+    is_partitioned_cookie,
     merge_browser_cookie_payloads,
     normalize_cookie_storage_text,
 )
@@ -63,6 +69,14 @@ def resolve_effective_personal_max_resident_tabs(value) -> int:
 
 PERSONAL_COOKIE_PREBIND_URL = "about:blank"
 PERSONAL_LABS_BOOTSTRAP_URL = "https://flow.google.com/projects"
+
+PERSONAL_HARVEST_PROMPT_POOL = (
+    "a red apple on a wooden table",
+    "a blue ceramic vase with sunflowers",
+    "a cozy mountain cabin in snow",
+    "a sailboat on a calm lake at sunrise",
+    "a hummingbird hovering near a red flower",
+)
 PERSONAL_COOKIE_TARGET_URLS = (
     "https://flow.google.com/",
     "https://www.google.com/",
@@ -627,6 +641,16 @@ def _resolve_browser_executable_path() -> tuple[Optional[str], str]:
     return None, "auto"
 
 
+def _personal_bare_mode_enabled() -> bool:
+    """Use a Chrome argument set that is as close to nodriver defaults as possible."""
+    return _env_truthy("PERSONAL_BROWSER_BARE_MODE")
+
+
+def _personal_startup_injection_disabled() -> bool:
+    """Disable startup JS patches for native-page compatibility experiments."""
+    return _env_truthy("PERSONAL_BROWSER_DISABLE_STARTUP_INJECTION")
+
+
 def _build_personal_browser_args(
     *,
     headless: bool,
@@ -639,8 +663,16 @@ def _build_personal_browser_args(
     - 始终依赖独立临时 user-data-dir，避免污染系统真实资料。
     - 显式去掉 `--profile-directory=Default` 这种容易误导的配置。
     - 显式加 `--no-startup-window`，避免 Chrome 先弹一个默认普通窗口。
-    - 仅在未加载代理认证扩展时附加 `--incognito`，避免扩展在无痕窗口中失效。
+    - 不使用无痕/BWSI 会话；独立临时 profile 已保证账号隔离。
     """
+    if _personal_bare_mode_enabled():
+        browser_args = []
+        if proxy_server_arg:
+            browser_args.append(proxy_server_arg)
+        if proxy_extension_dir:
+            browser_args.append(f"--load-extension={proxy_extension_dir}")
+        return browser_args
+
     browser_args = [
         "--disable-quic",
         "--disable-features=UseDnsHttpsSvcb,OptimizationHints,AutofillServerCommunication,CertificateTransparencyComponentUpdater,MediaRouter,GlobalMediaControls",
@@ -679,9 +711,10 @@ def _build_personal_browser_args(
         # 代理认证扩展在 bwsi/incognito 风格会话下容易失效，保持临时 profile 即可满足隔离需求。
         browser_args.append(f"--load-extension={proxy_extension_dir}")
     else:
-        browser_args.append("--bwsi")
+        # The isolated temporary profile already prevents cross-account leakage.
+        # Incognito/BWSI sessions partition cookie storage and make injected
+        # Google authentication unavailable to normal Flow tabs.
         browser_args.append("--disable-extensions")
-        browser_args.append("--incognito")
 
     return browser_args
 
@@ -1530,6 +1563,9 @@ class ResidentTabInfo:
         self.cookie_signature: Optional[str] = None
         self.session_cookies: Optional[Dict[str, str]] = None
         self.session_cookies_fetched_at: float = 0.0
+        self.last_harvest_session_id: Optional[str] = None
+        self.last_solve_used_native_harvest = False
+        self.prefer_native_harvest = False
         self.solve_lock = asyncio.Lock()  # 串行化同一标签页上的执行，降低并发冲突
         self.pending_assignment_count = 0  # 选中但尚未真正进入 solve_lock 的请求数
 
@@ -1550,6 +1586,12 @@ class TokenPoolLease:
 
 class TokenPoolTimeoutError(TimeoutError):
     """严格 token 池模式下，请求在等待可用 token 时超时。"""
+
+
+class NativeGenerationOutcomeUnknownError(RuntimeError):
+    """The native request may have reached Flow; automatic retry is unsafe."""
+
+    outcome_unknown = True
 
 
 class BrowserCaptchaService:
@@ -1672,6 +1714,7 @@ class BrowserCaptchaService:
         self._running = False                            # 向后兼容
         self._recaptcha_ready = False                    # 向后兼容
         self._last_fingerprint: Optional[Dict[str, Any]] = None
+        self._solve_bundle_snapshots: Dict[str, Dict[str, Any]] = {}
         self._resident_error_streaks: dict[str, int] = {}
         self._resident_unavailable_slots: set[str] = set()
         self._resident_warmup_task: Optional[asyncio.Task] = None
@@ -5805,6 +5848,13 @@ class BrowserCaptchaService:
         try:
             from nodriver import cdp
 
+            await self._tab_evaluate(
+                tab,
+                PERSONAL_TRUSTED_RECAPTCHA_HOOK_SOURCE,
+                label=f"evaluate_runtime_recaptcha_hook:{label}",
+                timeout_seconds=5.0,
+                return_by_value=True,
+            )
             await self._run_with_timeout(
                 tab.send(
                     cdp.page.add_script_to_evaluate_on_new_document(
@@ -5838,6 +5888,12 @@ class BrowserCaptchaService:
         browser_context_id: Any = None,
         target_url: Optional[str] = None,
     ) -> None:
+        if _personal_startup_injection_disabled():
+            debug_logger.log_info(
+                f"[BrowserCaptcha] 已禁用 personal 启动注入 (label={label})"
+            )
+            return
+        await self._apply_trusted_recaptcha_hook(tab, label=f"{label}:trusted_recaptcha")
         await self._apply_runtime_profile_to_tab(
             tab,
             label=label,
@@ -7373,6 +7429,7 @@ class BrowserCaptchaService:
         label: str,
         browser_context_id: Any = None,
         timeout_seconds: float = 8.0,
+        tab=None,
     ) -> int:
         if not self.browser:
             raise RuntimeError("browser runtime unavailable")
@@ -7383,16 +7440,19 @@ class BrowserCaptchaService:
 
         from nodriver import cdp
 
-        if browser_context_id is None:
-            cookie_command = cdp.storage.set_cookies(cookie_params)
+        if browser_context_id is None and tab is not None:
+            # Headed resident tabs reuse the default browser context. Sending the
+            # Network command to that tab keeps cookies in the same profile session.
+            cookie_command = cdp.network.set_cookies(cookie_params)
         else:
             cookie_command = cdp.storage.set_cookies(
                 cookie_params,
                 browser_context_id=browser_context_id,
             )
 
+        command_target = tab if browser_context_id is None and tab else self.browser
         await self._run_with_timeout(
-            self.browser.send(cookie_command),
+            command_target.send(cookie_command),
             timeout_seconds=timeout_seconds,
             label=label,
         )
@@ -7420,6 +7480,7 @@ class BrowserCaptchaService:
             label=f"storage.set_cookies:{label}:startup_cookie",
             browser_context_id=browser_context_id,
             timeout_seconds=8.0,
+            tab=tab,
         )
         if cookie_count <= 0:
             raise RuntimeError(
@@ -7469,6 +7530,8 @@ class BrowserCaptchaService:
     def _serialize_browser_cookie_for_storage(
         cls, cookie: Any
     ) -> Optional[Dict[str, Any]]:
+        if is_partitioned_cookie(cookie):
+            return None
         if isinstance(cookie, dict):
             source = dict(cookie)
         else:
@@ -7545,8 +7608,12 @@ class BrowserCaptchaService:
         if name.startswith("__Host-"):
             serialized.pop("domain", None)
             serialized["path"] = "/"
-            if "url" not in serialized:
-                serialized["url"] = "https://flow.google.com/"
+            origin = urlparse(
+                url or (f"https://{domain.lstrip('.')}/" if domain else "https://flow.google.com/")
+            )
+            serialized["url"] = (
+                f"https://{origin.netloc}/" if origin.netloc else "https://flow.google.com/"
+            )
 
         return serialized
 
@@ -7660,10 +7727,14 @@ class BrowserCaptchaService:
             return False
 
         try:
-            browser_context_id = (
-                resident_info.browser_context_id
-                or self._extract_tab_browser_context_id(resident_info.tab)
-            )
+            browser_context_id = resident_info.browser_context_id
+            if self.headless:
+                browser_context_id = (
+                    browser_context_id
+                    or self._extract_tab_browser_context_id(resident_info.tab)
+                )
+            else:
+                browser_context_id = None
             resident_info.browser_context_id = browser_context_id
 
             async def apply_cookie_update():
@@ -7672,6 +7743,7 @@ class BrowserCaptchaService:
                     label=f"storage.set_cookies:{label}:{token_key}",
                     browser_context_id=browser_context_id,
                     timeout_seconds=8.0,
+                    tab=resident_info.tab,
                 )
 
             cookie_count = 0
@@ -7972,21 +8044,26 @@ class BrowserCaptchaService:
             try:
                 from nodriver import cdp
 
-                browser_context_id = (
-                    resident_info.browser_context_id
-                    or self._extract_tab_browser_context_id(resident_info.tab)
-                )
+                browser_context_id = resident_info.browser_context_id
+                if self.headless and browser_context_id is None:
+                    browser_context_id = self._extract_tab_browser_context_id(
+                        resident_info.tab
+                    )
+                else:
+                    browser_context_id = None
                 resident_info.browser_context_id = browser_context_id
 
                 async with resident_info.solve_lock:
                     if browser_context_id is None:
-                        clear_cookie_command = cdp.storage.clear_cookies()
+                        clear_cookie_command = cdp.network.clear_browser_cookies()
+                        clear_target = resident_info.tab
                     else:
                         clear_cookie_command = cdp.storage.clear_cookies(
                             browser_context_id=browser_context_id
                         )
+                        clear_target = self.browser
                     await self._run_with_timeout(
-                        self.browser.send(clear_cookie_command),
+                        clear_target.send(clear_cookie_command),
                         timeout_seconds=8.0,
                         label=f"storage.clear_cookies:{label}:{token_key}",
                     )
@@ -10866,6 +10943,7 @@ class BrowserCaptchaService:
         error_message: str = "",
         token_id: Optional[int] = None,
         slot_id: Optional[str] = None,
+        issued_at: Optional[float] = None,
     ):
         """上游生成接口异常时，对常驻标签页执行自愈恢复。"""
         if not project_id:
@@ -10879,6 +10957,12 @@ class BrowserCaptchaService:
                     debug_logger.log_warning(
                         f"[BrowserCaptcha] project_id={project_id}, slot={resolved_slot_id} 上游异常回调命中已失效 slot，跳过本次恢复"
                     )
+                    return
+                if (
+                    (token_id is not None and resident_info.token_id != token_id)
+                    or (issued_at is not None and resident_info.created_at > float(issued_at))
+                ):
+                    # A late result must not restart a rebuilt tab or a different account.
                     return
             else:
                 resolved_slot_id, resident_info = (
@@ -10908,6 +10992,18 @@ class BrowserCaptchaService:
         debug_logger.log_warning(
             f"[BrowserCaptcha] project_id={project_id}, slot={resolved_slot_id} 收到上游异常，streak={streak}, reason={error_reason}, detail={error_message[:200]}"
         )
+
+        if (
+            str(getattr(config, "personal_solve_strategy", "auto") or "auto") == "auto"
+            and resident_info is not None
+            and not resident_info.last_solve_used_native_harvest
+            and self._is_recaptcha_cache_reset_error(error_text)
+        ):
+            resident_info.prefer_native_harvest = True
+            debug_logger.log_warning(
+                f"[BrowserCaptcha] project_id={project_id}, slot={resolved_slot_id} "
+                "trusted JS token 被 reCAPTCHA 风控拒绝，auto 后续优先使用原生 harvest"
+            )
 
         if not self._initialized or not self.browser:
             return
@@ -11209,66 +11305,115 @@ class BrowserCaptchaService:
         debug_logger.log_warning("[BrowserCaptcha] 自定义 reCAPTCHA 加载超时")
         return False
 
+    @staticmethod
+    def _generate_native_flow_session_id() -> str:
+        """Mirror Flow's JavaScript seed -> deterministic UUID session mapping."""
+        seed = str(uuid.uuid4())
+        chars = list(hashlib.sha256(seed.encode("utf-8")).hexdigest()[:32])
+        chars[12] = "4"
+        chars[16] = format((int(chars[16], 16) & 3) | 8, "x")
+        joined = "".join(chars)
+        return (
+            f"{joined[:8]}-{joined[8:12]}-{joined[12:16]}-"
+            f"{joined[16:20]}-{joined[20:]}"
+        )
+
+    async def _apply_trusted_recaptcha_hook(self, tab, *, label: str) -> bool:
+        if tab is None:
+            return False
+
+        try:
+            from nodriver import cdp
+
+            # Runtime evaluation keeps the action guard active on the current
+            # document even when CDP's new-document registration is not applied.
+            await self._tab_evaluate(
+                tab,
+                PERSONAL_TRUSTED_RECAPTCHA_HOOK_SOURCE,
+                label=f"evaluate_runtime_recaptcha_hook:{label}",
+                timeout_seconds=5.0,
+                return_by_value=True,
+            )
+            if getattr(tab, "_personal_trusted_recaptcha_hook_applied", None) is True:
+                return True
+
+            await self._run_with_timeout(
+                tab.send(
+                    cdp.page.add_script_to_evaluate_on_new_document(
+                        PERSONAL_TRUSTED_RECAPTCHA_HOOK_SOURCE,
+                        run_immediately=True,
+                    )
+                ),
+                timeout_seconds=5.0,
+                label=f"page.add_script_to_evaluate_on_new_document:recaptcha_hook:{label}",
+            )
+            try:
+                tab._personal_trusted_recaptcha_hook_applied = True
+            except Exception:
+                pass
+            debug_logger.log_info(
+                "[BrowserCaptcha] 已安装新版 Flow trusted reCAPTCHA 捕获钩子 "
+                f"(label={label})"
+            )
+            return True
+        except Exception as e:
+            debug_logger.log_warning(
+                f"[BrowserCaptcha] 安装 trusted reCAPTCHA 捕获钩子失败 ({label}): {e}"
+            )
+            return False
+
+
     async def _execute_recaptcha_on_tab(
-        self, tab, action: str = "IMAGE_GENERATION"
-    ) -> Optional[str]:
-        """在指定标签页执行 reCAPTCHA 获取 token
+        self,
+        tab,
+        action: str = "IMAGE_GENERATION",
+        project_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Execute the page's pre-hijack reCAPTCHA closure on the current Flow app.
 
-        Args:
-            tab: nodriver 标签页对象
-            action: reCAPTCHA action类型 (IMAGE_GENERATION 或 VIDEO_GENERATION)
-
-        Returns:
-            reCAPTCHA token 或 None
+        New Flow saves the original ``enterprise.execute`` bound function before
+        replacing the public method with an ``extension_hijack_detected`` wrapper.
+        The startup bind hook captures that original function, allowing direct JS
+        solves to use the same trusted closure as the page itself.
         """
+        normalized_action = str(action or "IMAGE_GENERATION").strip().upper()
+        normalized_project_id = str(project_id or "").strip()
+        if normalized_action != "CHAT_GENERATION" or not normalized_project_id:
+            await self._wait_for_recaptcha(tab)
+
+        if normalized_action == "CHAT_GENERATION" and normalized_project_id:
+            await self._apply_trusted_recaptcha_hook(
+                tab, label=f"direct_project:{normalized_project_id}"
+            )
+            await self._tab_get(
+                tab,
+                PERSONAL_COOKIE_PREBIND_URL,
+                label=f"direct_project_reset:{normalized_project_id}",
+                timeout_seconds=self._navigation_timeout_seconds,
+            )
+            await self._tab_get(
+                tab,
+                f"https://flow.google.com/project/{normalized_project_id}",
+                label=f"direct_project_open:{normalized_project_id}",
+                timeout_seconds=self._navigation_timeout_seconds,
+            )
+            await self._wait_for_document_ready(
+                tab, retries=30, interval_seconds=0.5
+            )
+            await self._apply_trusted_recaptcha_hook(
+                tab, label=f"direct_project_ready:{normalized_project_id}"
+            )
+            await self._wait_for_recaptcha(tab)
+
         execute_timeout_ms = int(max(1000, self._solve_timeout_seconds * 1000))
+        script = build_recaptcha_execute_script(
+            self.website_key, normalized_action, execute_timeout_ms
+        )
         execute_result = await self._tab_evaluate(
             tab,
-            f"""
-                (async () => {{
-                    const finishError = (error) => {{
-                        const message = error && error.message ? error.message : String(error || 'execute failed');
-                        return {{ ok: false, error: message }};
-                    }};
-
-                    try {{
-                        const token = await new Promise((resolve, reject) => {{
-                            let settled = false;
-                            const done = (handler, value) => {{
-                                if (settled) return;
-                                settled = true;
-                                handler(value);
-                            }};
-                            const timer = setTimeout(() => {{
-                                done(reject, new Error('execute timeout'));
-                            }}, {execute_timeout_ms});
-
-                            try {{
-                                grecaptcha.enterprise.ready(() => {{
-                                    grecaptcha.enterprise.execute({json.dumps(self.website_key)}, {{action: {json.dumps(action)}}})
-                                        .then((token) => {{
-                                            clearTimeout(timer);
-                                            done(resolve, token);
-                                        }})
-                                        .catch((error) => {{
-                                            clearTimeout(timer);
-                                            done(reject, error);
-                                        }});
-                                }});
-                            }} catch (error) {{
-                                clearTimeout(timer);
-                                done(reject, error);
-                            }}
-                        }});
-
-                        return {{ ok: true, token }};
-                    }} catch (error) {{
-                        return finishError(error);
-                    }}
-                }})()
-            """,
-            label=f"execute_recaptcha:{action}",
-            timeout_seconds=self._solve_timeout_seconds + 2.0,
+            script,
+            label=f"execute_trusted_recaptcha:{normalized_action}",
+            timeout_seconds=self._solve_timeout_seconds + 12.0,
             await_promise=True,
             return_by_value=True,
         )
@@ -11283,18 +11428,809 @@ class BrowserCaptchaService:
                 else execute_result
             )
             if error:
-                debug_logger.log_error(f"[BrowserCaptcha] reCAPTCHA 错误: {error}")
+                debug_logger.log_error(
+                    f"[BrowserCaptcha] trusted reCAPTCHA 错误: {error}"
+                )
+            return None
 
-        if token:
-            debug_logger.log_info(
-                f"[BrowserCaptcha] ✅ Token 获取成功 (长度: {len(token)})"
+        session_id = (
+            self._generate_native_flow_session_id()
+            if normalized_action == "CHAT_GENERATION"
+            else None
+        )
+        debug_logger.log_info(
+            "[BrowserCaptcha] ✅ trusted reCAPTCHA Token获取成功 "
+            f"(action={normalized_action}, 长度={len(token)}, "
+            f"session={'yes' if session_id else 'no'})"
+        )
+        return {"token": token, "session_id": session_id}
+
+    @staticmethod
+    def _parse_native_harvest_post_data(
+        post_data: Optional[str],
+    ) -> Optional[Dict[str, Any]]:
+        """Parse a native Flow StreamChat form body into token and session id."""
+        if not post_data:
+            return None
+
+        try:
+            freq_value = next(
+                value
+                for key, value in parse_qsl(post_data, keep_blank_values=True)
+                if key == "f.req"
             )
-        else:
+            outer = json.loads(freq_value)
+            inner = json.loads(outer[1]) if len(outer) > 1 else None
+        except (StopIteration, TypeError, ValueError, json.JSONDecodeError):
+            return None
+
+        if not isinstance(inner, list) or not inner:
+            return None
+        session_id = str(inner[0] or "").strip() or None
+
+        token = ""
+
+        def walk(value: Any) -> None:
+            nonlocal token
+            if token or not isinstance(value, list):
+                return
+            if (
+                len(value) == 2
+                and isinstance(value[0], str)
+                and len(value[0]) >= 100
+                and all(
+                    character.isalnum() or character in {"-", "_"}
+                    for character in value[0]
+                )
+                and value[1] == 1
+            ):
+                token = value[0]
+                return
+            for item in value:
+                walk(item)
+
+        walk(inner)
+        if not token:
+            return None
+        return {"token": token, "session_id": session_id}
+
+    async def _install_native_harvest_hook(self, tab) -> bool:
+        """Capture the page's own StreamChat request before it is consumed."""
+        script = """(() => {
+            const storageKey = '__flow2apiNativeHarvestBody';
+            window[storageKey] = '';
+            if (window.__flow2apiNativeHarvestPatched) return true;
+            window.__flow2apiNativeHarvestPatched = true;
+
+            const originalOpen = XMLHttpRequest.prototype.open;
+            const originalSend = XMLHttpRequest.prototype.send;
+            XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+                this.__flow2apiRequestUrl = String(url || '');
+                return originalOpen.call(this, method, url, ...rest);
+            };
+            XMLHttpRequest.prototype.send = function(body) {
+                if (
+                    this.__flow2apiRequestUrl.includes('StreamChat') &&
+                    !window[storageKey]
+                ) {
+                    window[storageKey] = String(body || '');
+                    try { this.abort(); } catch (error) {}
+                    return;
+                }
+                return originalSend.call(this, body);
+            };
+
+            const originalFetch = window.fetch;
+            if (typeof originalFetch === 'function') {
+                window.fetch = function(input, init) {
+                    let url = '';
+                    if (typeof input === 'string') url = input;
+                    else if (input && typeof input.url === 'string') url = input.url;
+                    if (String(url || '').includes('StreamChat') && !window[storageKey]) {
+                        window[storageKey] = String((init && init.body) || '');
+                        return Promise.reject(new TypeError('Request aborted'));
+                    }
+                    return originalFetch.call(window, input, init);
+                };
+            }
+            return true;
+        })()"""
+        try:
+            result = await self._tab_evaluate(
+                tab,
+                script,
+                label="install_native_harvest_hook",
+                timeout_seconds=5.0,
+                return_by_value=True,
+            )
+            return result is True
+        except Exception as e:
             debug_logger.log_warning(
-                "[BrowserCaptcha] Token 获取失败，交由上层执行标签页恢复"
+                f"[BrowserCaptcha] 安装原生 harvest 拦截失败: {type(e).__name__}: {str(e)[:160]}"
+            )
+            return False
+
+    async def _dismiss_native_page_overlays(self, tab, *, label: str) -> None:
+        """Dismiss Flow onboarding overlays without touching the prompt editor."""
+        labels = (
+            "Next",
+            "Continue",
+            "Start",
+            "Got it",
+            "Close",
+            "Skip",
+            "Not now",
+            "Agree",
+            "Accept",
+        )
+        script = """(labels => {
+            const buttons = Array.from(
+                document.querySelectorAll('.cdk-overlay-container button')
+            ).filter(button => {
+                const text = String(button.innerText || '').trim().toLowerCase();
+                return text && labels.some(label => text.includes(label));
+            });
+            const button = buttons.find(item => item.offsetParent !== null) || buttons[0];
+            if (!button) return '';
+            button.click();
+            return String(button.innerText || '').trim();
+        })(%s)""" % json.dumps(labels)
+
+        for _ in range(8):
+            try:
+                clicked = await self._tab_evaluate(
+                    tab,
+                    script,
+                    label=f"dismiss_native_overlay:{label}",
+                    timeout_seconds=3.0,
+                    return_by_value=True,
+                )
+            except Exception:
+                clicked = ""
+            if not clicked:
+                return
+            await asyncio.sleep(0.8)
+
+    async def _wait_for_native_prompt_editor(self, tab, *, label: str) -> bool:
+        for _ in range(60):
+            try:
+                ready = await self._tab_evaluate(
+                    tab,
+                    "Boolean(document.querySelector('.ProseMirror'))",
+                    label=f"native_editor_wait:{label}",
+                    timeout_seconds=2.0,
+                    return_by_value=True,
+                )
+                if ready is True:
+                    return True
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
+        return False
+
+    async def _submit_native_prompt(self, tab, prompt: str, *, label: str) -> None:
+        from nodriver import cdp
+
+        editor = await tab.select(".ProseMirror", timeout=10)
+        if editor is None:
+            raise RuntimeError("Flow prompt editor is unavailable")
+        await editor.click()
+        await editor.send_keys(prompt)
+
+        await tab.send(
+            cdp.input_.dispatch_key_event(
+                "keyDown",
+                key="Enter",
+                code="Enter",
+                windows_virtual_key_code=13,
+                native_virtual_key_code=13,
+            )
+        )
+        await tab.send(
+            cdp.input_.dispatch_key_event(
+                "keyUp",
+                key="Enter",
+                code="Enter",
+                windows_virtual_key_code=13,
+                native_virtual_key_code=13,
+            )
+        )
+        debug_logger.log_info(
+            f"[BrowserCaptcha] {label} 已触发页面原生 StreamChat 提交"
+        )
+
+    @staticmethod
+    def _build_native_stream_fetch_source(
+        *,
+        project_id: str,
+        prompt: str,
+        recaptcha_token: str,
+        session_id: str,
+        timeout_ms: int,
+    ) -> str:
+        values = {
+            "projectId": project_id,
+            "prompt": prompt,
+            "recaptchaToken": recaptcha_token,
+            "sessionId": session_id,
+            "timeoutMs": int(timeout_ms),
+        }
+        return """(async config => {
+            const pageResponse = await fetch(location.href, {
+                credentials: 'include'
+            });
+            const bootstrap = await pageResponse.text();
+            const bootloader = bootstrap.match(
+                /boq_labs-ai-sandbox-frontend_[A-Za-z0-9_.-]+/
+            );
+            const sessionMatch = bootstrap.match(/"FdrFJe":"(-?[0-9]+)"/);
+            const atMatch = bootstrap.match(/"SNlM0e":"([^"]+)"/);
+            if (!bootloader || !sessionMatch || !atMatch) {
+                throw new Error('Flow frontend bootstrap metadata is unavailable');
+            }
+
+            const inner = [
+                config.sessionId,
+                [[[[config.prompt]]]],
+                [
+                    `projects/${config.projectId}`,
+                    null,
+                    [config.recaptchaToken, 1],
+                    null,
+                    null,
+                    1
+                ]
+            ];
+            const body = new URLSearchParams();
+            body.set('f.req', JSON.stringify([null, JSON.stringify(inner)]));
+            body.set('at', atMatch[1]);
+            const url =
+                `/_/AiSandboxAngularFrontend/data/google.internal.labs.aisandbox.proto.flow.agent.v1.FlowCreationAgentService/StreamChat` +
+                `?bl=${encodeURIComponent(bootloader[0])}` +
+                `&f.sid=${sessionMatch[1]}&hl=${encodeURIComponent(navigator.language || 'en')}` +
+                `&_reqid=${Math.floor(100000 + Math.random() * 900000)}&rt=c`;
+            const controller = new AbortController();
+            const timer = setTimeout(
+                () => controller.abort('flow_stream_timeout'),
+                config.timeoutMs
+            );
+            try {
+                const response = await fetch(url, {
+                    method: 'POST',
+                    credentials: 'include',
+                    referrer: 'https://flow.google.com/',
+                    headers: {
+                        'Accept': '*/*',
+                        'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+                        'x-client-deadline-ms': '600000',
+                        'x-same-domain': '1'
+                    },
+                    body,
+                    signal: controller.signal
+                });
+                const text = await response.text();
+                return { status: response.status, text };
+            } finally {
+                clearTimeout(timer);
+            }
+        })(__REQUEST_CONFIG__)""".replace(
+            "__REQUEST_CONFIG__", json.dumps(values, ensure_ascii=False, separators=(",", ":"))
+        )
+
+    async def _submit_native_stream_chat_with_resident(
+        self,
+        resident_info,
+        *,
+        project_id: str,
+        prompt: str,
+        recaptcha_token: str,
+        session_id: str,
+        timeout: int,
+    ) -> Dict[str, Any]:
+        """Submit StreamChat while the caller owns ``resident_info.solve_lock``."""
+        script = self._build_native_stream_fetch_source(
+            project_id=project_id,
+            prompt=prompt,
+            recaptcha_token=recaptcha_token,
+            session_id=session_id,
+            timeout_ms=max(5000, int(timeout * 1000)),
+        )
+        try:
+            result = await self._run_with_timeout(
+                self._tab_evaluate(
+                    resident_info.tab,
+                    script,
+                    label=f"native_stream_submit:{project_id}:{session_id}",
+                    timeout_seconds=max(35.0, float(timeout) + 10.0),
+                    await_promise=True,
+                    return_by_value=True,
+                ),
+                timeout_seconds=max(40.0, float(timeout) + 15.0),
+                label=f"native_stream_submit_timeout:{project_id}:{session_id}",
+            )
+        except Exception as exc:
+            raise NativeGenerationOutcomeUnknownError(
+                "personal StreamChat submission outcome is unknown"
+            ) from exc
+        if not isinstance(result, dict):
+            raise RuntimeError("personal browser StreamChat returned an invalid payload")
+        status = int(result.get("status") or 0)
+        text = str(result.get("text") or "")
+        if status < 200 or status >= 300:
+            raise RuntimeError(
+                f"personal browser StreamChat failed: HTTP {status}, body={text[:300]}"
+            )
+        if "PUBLIC_ERROR_" in text:
+            error_match = re.search(r"PUBLIC_ERROR_[A-Z_]+", text)
+            raise RuntimeError(
+                "Flow StreamChat rejected: "
+                f"error={error_match.group(0) if error_match else 'UNKNOWN'}"
+            )
+        return {
+            "responseText": text,
+            "rawLength": len(text),
+            "session_id": session_id,
+            "slot_id": resident_info.slot_id,
+        }
+
+    async def _submit_native_stream_chat_on_tab(
+        self,
+        *,
+        project_id: str,
+        prompt: str,
+        recaptcha_token: str,
+        session_id: str,
+        timeout: int,
+    ) -> Dict[str, Any]:
+        normalized_session = str(session_id or "").strip()
+        if not normalized_session:
+            raise RuntimeError("personal StreamChat session id is missing")
+
+        async with self._resident_lock:
+            resident_info = next(
+                (
+                    info
+                    for info in self._resident_tabs.values()
+                    if info.last_harvest_session_id == normalized_session
+                ),
+                None,
             )
 
-        return token
+        if resident_info is None or not resident_info.tab:
+            raise RuntimeError("personal StreamChat resident tab is unavailable")
+        async with resident_info.solve_lock:
+            if resident_info.last_harvest_session_id != normalized_session:
+                raise RuntimeError("personal StreamChat session is no longer active")
+            return await self._submit_native_stream_chat_with_resident(
+                resident_info,
+                project_id=project_id,
+                prompt=prompt,
+                recaptcha_token=recaptcha_token,
+                session_id=normalized_session,
+                timeout=timeout,
+            )
+
+    async def submit_native_stream_chat(
+        self,
+        *,
+        project_id: str,
+        prompt: str,
+        recaptcha_token: str,
+        session_id: str,
+        timeout: int,
+    ) -> Dict[str, Any]:
+        return await self._submit_native_stream_chat_on_tab(
+            project_id=project_id,
+            prompt=prompt,
+            recaptcha_token=recaptcha_token,
+            session_id=session_id,
+            timeout=timeout,
+        )
+
+    async def _install_native_generation_observer(self, tab) -> bool:
+        """Let Flow's native StreamChat request continue and capture its response."""
+        script = """(() => {
+            const stateKey = '__flow2apiNativeGeneration';
+            window[stateKey] = {done:false,status:0,requestBody:'',responseText:'',error:''};
+            if (window.__flow2apiNativeGenerationPatched) return true;
+            window.__flow2apiNativeGenerationPatched = true;
+            const originalOpen = XMLHttpRequest.prototype.open;
+            const originalSend = XMLHttpRequest.prototype.send;
+            XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+                this.__flow2apiNativeGenerationUrl = String(url || '');
+                return originalOpen.call(this, method, url, ...rest);
+            };
+            XMLHttpRequest.prototype.send = function(body) {
+                const url = this.__flow2apiNativeGenerationUrl || '';
+                if (!url.includes('StreamChat')) return originalSend.call(this, body);
+                const request = this;
+                const state = window[stateKey];
+                state.requestBody = String(body || '');
+                request.addEventListener('readystatechange', () => {
+                    if (request.readyState !== 4) return;
+                    try {
+                        state.status = Number(request.status || 0);
+                        state.responseText = String(request.responseText || '');
+                        state.done = true;
+                    } catch (error) {
+                        state.error = String(error || 'response read failed');
+                        state.done = true;
+                    }
+                });
+                request.addEventListener('error', () => {
+                    state.error = 'network error';
+                    state.done = true;
+                });
+                return originalSend.call(this, body);
+            };
+
+            const originalFetch = window.fetch;
+            if (typeof originalFetch === 'function') {
+                window.fetch = async function(input, init) {
+                    let url = '';
+                    if (typeof input === 'string') url = input;
+                    else if (input && typeof input.url === 'string') url = input.url;
+                    if (!String(url || '').includes('StreamChat')) {
+                        return originalFetch.call(window, input, init);
+                    }
+                    const state = window[stateKey];
+                    state.requestBody = String((init && init.body) || '');
+                    try {
+                        const response = await originalFetch.call(window, input, init);
+                        const clone = response.clone();
+                        state.status = Number(response.status || 0);
+                        clone.text().then(text => {
+                            state.responseText = String(text || '');
+                            state.done = true;
+                        }).catch(error => {
+                            state.error = String(error || 'response read failed');
+                            state.done = true;
+                        });
+                        return response;
+                    } catch (error) {
+                        state.error = String(error || 'network error');
+                        state.done = true;
+                        throw error;
+                    }
+                };
+            }
+            return true;
+        })()"""
+        try:
+            result = await self._tab_evaluate(
+                tab, script, label="install_native_generation_observer",
+                timeout_seconds=5.0, return_by_value=True,
+            )
+            return result is True
+        except Exception as e:
+            debug_logger.log_warning(
+                f"[BrowserCaptcha] 安装原生生成响应观察器失败: {type(e).__name__}: {str(e)[:180]}"
+            )
+            return False
+
+    async def _generate_native_image_on_tab(
+        self, resident_info, project_id: str, prompt: str, timeout: int
+    ) -> Optional[Dict[str, Any]]:
+        normalized_project_id = str(project_id or "").strip()
+        if not normalized_project_id or not resident_info or not resident_info.tab:
+            return None
+        tab = resident_info.tab
+        label = f"native_generate:{resident_info.slot_id}"
+        submitted = False
+        try:
+            await self._tab_get(
+                tab, PERSONAL_COOKIE_PREBIND_URL,
+                label=f"{label}:reset", timeout_seconds=self._navigation_timeout_seconds,
+            )
+            await self._tab_get(
+                tab, f"https://flow.google.com/project/{normalized_project_id}",
+                label=f"{label}:project", timeout_seconds=self._navigation_timeout_seconds,
+            )
+            await self._wait_for_document_ready(tab, retries=30, interval_seconds=0.5)
+            await self._dismiss_native_page_overlays(tab, label=label)
+            if not await self._wait_for_recaptcha(tab):
+                raise RuntimeError("native generation page recaptcha is not ready")
+            if not await self._wait_for_native_prompt_editor(tab, label=label):
+                raise RuntimeError("native generation prompt editor is not ready")
+            if not await self._install_native_generation_observer(tab):
+                raise RuntimeError("native generation observer is unavailable")
+            await self._submit_native_prompt(tab, prompt, label=label)
+            submitted = True
+
+            deadline = time.monotonic() + max(30.0, float(timeout))
+            state_json = "{}"
+            while time.monotonic() < deadline:
+                try:
+                    state_json = str(
+                        await self._tab_evaluate(
+                            tab,
+                            "JSON.stringify(window.__flow2apiNativeGeneration || {})",
+                            label=f"read_native_generation:{resident_info.slot_id}",
+                            timeout_seconds=2.0, return_by_value=True,
+                        ) or "{}"
+                    )
+                except Exception:
+                    state_json = "{}"
+                try:
+                    state = json.loads(state_json)
+                except (TypeError, ValueError):
+                    state = {}
+                if state.get("done"):
+                    break
+                await self._dismiss_native_page_overlays(tab, label=f"{label}:waiting")
+                await asyncio.sleep(0.5)
+            try:
+                state = json.loads(state_json)
+            except (TypeError, ValueError):
+                state = {}
+            if not state.get("done"):
+                raise NativeGenerationOutcomeUnknownError(
+                    "native generation response timed out; outcome is unknown"
+                )
+            if state.get("error"):
+                raise NativeGenerationOutcomeUnknownError(
+                    f"native generation outcome is unknown: {state['error']}"
+                )
+            request_body = str(state.get("requestBody") or "")
+            harvest = self._parse_native_harvest_post_data(request_body)
+            status = int(state.get("status") or 0)
+            response_text = str(state.get("responseText") or "")
+            if status < 200 or status >= 300:
+                raise RuntimeError(
+                    f"native generation HTTP failed: status={status}, body={response_text[:240]}"
+                )
+            if "PUBLIC_ERROR_" in response_text:
+                error_match = re.search(r"PUBLIC_ERROR_[A-Z_]+", response_text)
+                raise RuntimeError(
+                    "Flow StreamChat rejected: "
+                    f"error={error_match.group(0) if error_match else 'UNKNOWN'}"
+                )
+            debug_logger.log_info(
+                f"[BrowserCaptcha] {label} 原生生成响应成功 "
+                f"(status={status}, chars={len(response_text)}, "
+                f"session={(harvest or {}).get('session_id') or '<empty>'})"
+            )
+            return {
+                "responseText": response_text,
+                "rawLength": len(response_text),
+                "session_id": (harvest or {}).get("session_id"),
+                "slot_id": resident_info.slot_id,
+                "fingerprint": self.get_last_fingerprint(),
+            }
+        except NativeGenerationOutcomeUnknownError:
+            raise
+        except Exception as e:
+            if submitted:
+                raise NativeGenerationOutcomeUnknownError(
+                    "native generation outcome is unknown"
+                ) from e
+            debug_logger.log_warning(
+                f"[BrowserCaptcha] {label} 原生生成失败: "
+                f"{type(e).__name__}: {str(e)[:240]}"
+            )
+            return None
+
+    async def generate_native_image(
+        self, *, project_id: str, prompt: str, token_id: Optional[int], timeout: int
+    ) -> Optional[Dict[str, Any]]:
+        self._mark_runtime_active()
+        await self.initialize()
+        slot_id, resident_info = await self._ensure_resident_tab(
+            project_id, token_id=token_id, reserve_for_solve=True, return_slot_key=True
+        )
+        reserved_slot_id = slot_id or None
+        reservation_consumed = False
+        started_at = time.time()
+        try:
+            if not slot_id or not resident_info:
+                return None
+            used_native_harvest = False
+            async with resident_info.solve_lock:
+                await self._consume_resident_slot_reservation(
+                    slot_id, resident_info=resident_info
+                )
+                reservation_consumed = True
+                solve_mode = self._personal_solve_mode(
+                    "CHAT_GENERATION", resident_info
+                )
+                auto_mode = (
+                    str(
+                        getattr(config, "personal_solve_strategy", "auto") or "auto"
+                    )
+                    == "auto"
+                )
+                result = None
+                if solve_mode == "direct":
+                    try:
+                        direct_result = await self._run_with_timeout(
+                            self._execute_recaptcha_on_tab(
+                                resident_info.tab,
+                                "CHAT_GENERATION",
+                                project_id=project_id,
+                            ),
+                            timeout_seconds=self._solve_timeout_seconds + 12.0,
+                            label=f"native_generate_direct:{project_id}",
+                        )
+                    except Exception as direct_solve_error:
+                        if not auto_mode:
+                            raise
+                        debug_logger.log_warning(
+                            "[BrowserCaptcha] trusted JS 取码失败，"
+                            f"auto 切换原生 harvest: {direct_solve_error}"
+                        )
+                        direct_result = None
+                    direct_token = str(
+                        (direct_result or {}).get("token") or ""
+                    ).strip()
+                    direct_session = str(
+                        (direct_result or {}).get("session_id") or ""
+                    ).strip()
+                    if direct_token and direct_session:
+                        resident_info.last_harvest_session_id = direct_session
+                        try:
+                            result = await self._submit_native_stream_chat_with_resident(
+                                resident_info,
+                                project_id=project_id,
+                                prompt=prompt,
+                                recaptcha_token=direct_token,
+                                session_id=direct_session,
+                                timeout=timeout,
+                            )
+                        except Exception as direct_error:
+                            if not auto_mode or not self._is_recaptcha_cache_reset_error(
+                                str(direct_error)
+                            ):
+                                raise
+                            debug_logger.log_warning(
+                                "[BrowserCaptcha] trusted JS StreamChat 提交失败，"
+                                f"auto 切换原生 harvest: {direct_error}"
+                            )
+                            resident_info.prefer_native_harvest = True
+
+                if result is None and (solve_mode == "harvest" or auto_mode):
+                    used_native_harvest = True
+                    result = await self._run_with_timeout(
+                        self._generate_native_image_on_tab(
+                            resident_info, project_id, prompt, timeout
+                        ),
+                        timeout_seconds=max(40.0, float(timeout) + 30.0),
+                        label=f"native_generate_timeout:{project_id}",
+                    )
+                if not result:
+                    return None
+                resident_info.last_used_at = time.time()
+                resident_info.use_count += 1
+                resident_info.last_harvest_session_id = (
+                    str(result.get("session_id") or "").strip() or None
+                )
+                resident_info.last_solve_used_native_harvest = used_native_harvest
+                resident_info.fingerprint = await self._refresh_last_fingerprint(
+                    resident_info.tab
+                )
+                self._remember_fingerprint(resident_info.fingerprint)
+                self._remember_project_affinity(project_id, slot_id, resident_info)
+                self._remember_token_affinity(token_id, slot_id, resident_info)
+                self._resident_error_streaks.pop(slot_id, None)
+                self._mark_browser_health(True)
+                self._record_browser_solve_success(
+                    source="native_image",
+                    project_id=project_id,
+                )
+                try:
+                    await self._cache_session_cookies_for_computed(resident_info)
+                except Exception:
+                    pass
+                result["fingerprint"] = resident_info.fingerprint
+                result["elapsed_ms"] = int((time.time() - started_at) * 1000)
+            await self._maybe_execute_pending_fresh_profile_restart(
+                project_id,
+                token_id=token_id,
+                source="native_image_success",
+            )
+            return result
+        finally:
+            if reserved_slot_id and not reservation_consumed:
+                await self._release_resident_slot_reservation(
+                    reserved_slot_id,
+                    resident_info=self._resident_tabs.get(reserved_slot_id),
+                )
+
+    async def _execute_native_harvest_on_tab(
+        self,
+        resident_info,
+        project_id: str,
+        action: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Trigger Flow's native submission and harvest its reCAPTCHA bundle."""
+        _ = action
+        normalized_project_id = str(project_id or "").strip()
+        if not normalized_project_id or not resident_info or not resident_info.tab:
+            return None
+
+        tab = resident_info.tab
+        project_url = f"https://flow.google.com/project/{normalized_project_id}"
+        label = f"native_harvest:{resident_info.slot_id}"
+
+        try:
+            await self._tab_get(
+                tab,
+                PERSONAL_COOKIE_PREBIND_URL,
+                label=f"{label}:reset",
+                timeout_seconds=self._navigation_timeout_seconds,
+            )
+            await self._tab_get(
+                tab,
+                project_url,
+                label=f"{label}:project",
+                timeout_seconds=self._navigation_timeout_seconds,
+            )
+            await self._wait_for_document_ready(
+                tab, retries=30, interval_seconds=0.5
+            )
+            await self._dismiss_native_page_overlays(tab, label=label)
+            if not await self._wait_for_recaptcha(tab):
+                debug_logger.log_warning(
+                    f"[BrowserCaptcha] {label} 页面 reCAPTCHA 未就绪"
+                )
+                return None
+            if not await self._wait_for_native_prompt_editor(tab, label=label):
+                debug_logger.log_warning(
+                    f"[BrowserCaptcha] {label} 页面提示词输入框未就绪"
+                )
+                return None
+            if not await self._install_native_harvest_hook(tab):
+                return None
+
+            prompt = random.choice(PERSONAL_HARVEST_PROMPT_POOL)
+            await self._submit_native_prompt(tab, prompt, label=label)
+
+            deadline = time.monotonic() + self._solve_timeout_seconds
+            post_data: Optional[str] = None
+            while time.monotonic() < deadline:
+                try:
+                    raw_body = await self._tab_evaluate(
+                        tab,
+                        "window.__flow2apiNativeHarvestBody || ''",
+                        label=f"read_native_harvest:{resident_info.slot_id}",
+                        timeout_seconds=2.0,
+                        return_by_value=True,
+                    )
+                except Exception:
+                    raw_body = ""
+                post_data = str(raw_body or "") or None
+                if post_data:
+                    break
+                await self._dismiss_native_page_overlays(
+                    tab, label=f"{label}:waiting"
+                )
+                await asyncio.sleep(0.5)
+
+            if not post_data:
+                debug_logger.log_warning(
+                    f"[BrowserCaptcha] {label} 未捕获页面原生 StreamChat 请求"
+                )
+                return None
+
+            harvest = self._parse_native_harvest_post_data(post_data)
+            if not harvest or not harvest.get("token"):
+                debug_logger.log_warning(
+                    f"[BrowserCaptcha] {label} 原生 StreamChat 请求体解析失败 "
+                    f"(body_len={len(post_data)})"
+                )
+                return None
+
+            debug_logger.log_info(
+                f"[BrowserCaptcha] {label} 原生 harvest 成功 "
+                f"(token_len={len(harvest['token'])}, "
+                f"session={harvest.get('session_id') or '<empty>'})"
+            )
+            return harvest
+        except Exception as e:
+            debug_logger.log_warning(
+                f"[BrowserCaptcha] {label} 原生 harvest 失败: "
+                f"{type(e).__name__}: {str(e)[:200]}"
+            )
+            return None
 
     async def _execute_custom_recaptcha_on_tab(
         self,
@@ -11692,6 +12628,7 @@ class BrowserCaptchaService:
         slot_id: Optional[str],
         fingerprint: Optional[Dict[str, Any]] = None,
         session_cookies: Optional[Dict[str, str]] = None,
+        session_id: Optional[str] = None,
         issued_at: Optional[float] = None,
         expires_at: Optional[float] = None,
     ) -> Dict[str, Any]:
@@ -11726,6 +12663,7 @@ class BrowserCaptchaService:
         return {
             "token": token,
             "project_id": project_id,
+            "session_id": str(session_id or "").strip() or None,
             "action": action,
             "token_id": token_id,
             "slot_id": slot_id,
@@ -11736,6 +12674,35 @@ class BrowserCaptchaService:
             "issued_at": issued_timestamp,
             "expires_at": expires_timestamp,
         }
+
+    @staticmethod
+    def _solve_bundle_snapshot_key(token: Optional[str]) -> str:
+        normalized = str(token or "").strip()
+        if not normalized:
+            return ""
+        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+    def _remember_solve_bundle_snapshot(self, bundle: Optional[Dict[str, Any]]) -> None:
+        if not isinstance(bundle, dict):
+            return
+        key = self._solve_bundle_snapshot_key(bundle.get("token"))
+        if not key:
+            return
+        self._solve_bundle_snapshots[key] = dict(bundle)
+        while len(self._solve_bundle_snapshots) > 128:
+            oldest_key = next(iter(self._solve_bundle_snapshots), None)
+            if oldest_key is None:
+                break
+            self._solve_bundle_snapshots.pop(oldest_key, None)
+
+    def _take_solve_bundle_snapshot(
+        self, token: Optional[str]
+    ) -> Optional[Dict[str, Any]]:
+        key = self._solve_bundle_snapshot_key(token)
+        if not key:
+            return None
+        bundle = self._solve_bundle_snapshots.pop(key, None)
+        return dict(bundle) if isinstance(bundle, dict) else None
 
     async def _cache_session_cookies_for_computed(self, resident_info):
         """提取 Google session cookies 供 reload 链路复用。"""
@@ -11881,44 +12848,41 @@ class BrowserCaptchaService:
             return dict(collected)
         return None
 
-    async def _solve_with_resident_tab(
+    def _personal_solve_mode(
         self,
+        action: str,
+        resident_info: Optional[ResidentTabInfo] = None,
+    ) -> str:
+        """Select ``direct`` or ``harvest`` for one personal solve request."""
+        # Native harvest produces CHAT_GENERATION tokens only.
+        if str(action or "").strip().upper() != "CHAT_GENERATION":
+            return "direct"
+        strategy = str(getattr(config, "personal_solve_strategy", "auto") or "auto")
+        if strategy == "harvest":
+            return "harvest"
+        if strategy == "direct":
+            return "direct"
+        if resident_info is not None and resident_info.prefer_native_harvest:
+            return "harvest"
+        return "direct"
+
+    def _uses_native_harvest(
+        self,
+        action: str,
+        resident_info: Optional[ResidentTabInfo] = None,
+    ) -> bool:
+        return self._personal_solve_mode(action, resident_info) == "harvest"
+
+    async def _finalize_resident_solve_locked(
+        self,
+        *,
+        token: str,
         slot_id: str,
         project_id: str,
-        resident_info: Optional[ResidentTabInfo],
         action: str,
-        *,
-        consume_reservation: bool = False,
-        success_label: str,
-    ) -> Optional[str]:
-        """在共享常驻标签页上执行一次打码，并统一更新成功态。"""
-        if (
-            not resident_info
-            or not resident_info.tab
-            or not resident_info.recaptcha_ready
-        ):
-            if consume_reservation:
-                await self._release_resident_slot_reservation(
-                    slot_id, resident_info=resident_info
-                )
-            return None
-
-        start_time = time.time()
-        async with resident_info.solve_lock:
-            if consume_reservation:
-                await self._consume_resident_slot_reservation(
-                    slot_id, resident_info=resident_info
-                )
-            token = await self._run_with_timeout(
-                self._execute_recaptcha_on_tab(resident_info.tab, action),
-                timeout_seconds=self._solve_timeout_seconds,
-                label=f"{success_label}:{slot_id}:{project_id}:{action}",
-            )
-
-        if not token:
-            return None
-
-        duration_ms = (time.time() - start_time) * 1000
+        resident_info: ResidentTabInfo,
+    ) -> int:
+        """Capture the immutable solve bundle before releasing ``solve_lock``."""
         resident_info.last_used_at = time.time()
         resident_info.use_count += 1
         browser_solve_count = self._record_browser_solve_success(
@@ -11932,11 +12896,113 @@ class BrowserCaptchaService:
             resident_info.tab
         )
         self._remember_fingerprint(resident_info.fingerprint)
-        # 同步提取 session cookie 供 reload 链路复用
         try:
             await self._cache_session_cookies_for_computed(resident_info)
         except Exception:
             pass
+        self._remember_solve_bundle_snapshot(
+            self._build_solve_bundle(
+                token=token,
+                project_id=project_id,
+                action=action,
+                token_id=resident_info.token_id,
+                slot_id=slot_id,
+                fingerprint=resident_info.fingerprint,
+                session_cookies=resident_info.session_cookies,
+                session_id=resident_info.last_harvest_session_id,
+            )
+        )
+        return browser_solve_count
+
+    async def _solve_with_resident_tab(
+        self,
+        slot_id: str,
+        project_id: str,
+        resident_info: Optional[ResidentTabInfo],
+        action: str,
+        *,
+        consume_reservation: bool = False,
+        success_label: str,
+    ) -> Optional[str]:
+        """在共享常驻标签页上执行一次打码，并统一更新成功态。"""
+        if not resident_info or not resident_info.tab:
+            if consume_reservation:
+                await self._release_resident_slot_reservation(
+                    slot_id, resident_info=resident_info
+                )
+            return None
+
+        start_time = time.time()
+        solve_mode = self._personal_solve_mode(action, resident_info)
+        auto_mode = (
+            str(getattr(config, "personal_solve_strategy", "auto") or "auto") == "auto"
+        )
+        resident_info.last_harvest_session_id = None
+        resident_info.last_solve_used_native_harvest = False
+        token: Optional[str] = None
+        async with resident_info.solve_lock:
+            if consume_reservation:
+                await self._consume_resident_slot_reservation(
+                    slot_id, resident_info=resident_info
+                )
+            if solve_mode == "direct":
+                try:
+                    direct_result = await self._run_with_timeout(
+                        self._execute_recaptcha_on_tab(
+                            resident_info.tab, action, project_id=project_id
+                        ),
+                        timeout_seconds=self._solve_timeout_seconds + 12.0,
+                        label=f"{success_label}:{slot_id}:{project_id}:{action}:direct",
+                    )
+                except Exception as direct_solve_error:
+                    if not auto_mode or str(action or "").strip().upper() != "CHAT_GENERATION":
+                        raise
+                    debug_logger.log_warning(
+                        f"[BrowserCaptcha] auto trusted JS 取码异常，切换原生 harvest "
+                        f"(slot={slot_id}, action={action}): {direct_solve_error}"
+                    )
+                    direct_result = None
+                token = str((direct_result or {}).get("token") or "").strip() or None
+                resident_info.last_harvest_session_id = (
+                    str((direct_result or {}).get("session_id") or "").strip() or None
+                )
+                if token:
+                    resident_info.last_solve_used_native_harvest = False
+
+            if (
+                not token
+                and str(action or "").strip().upper() == "CHAT_GENERATION"
+                and (solve_mode == "harvest" or auto_mode)
+            ):
+                if solve_mode == "direct":
+                    debug_logger.log_warning(
+                        f"[BrowserCaptcha] auto 策略下 trusted JS 取码失败，"
+                        f"切换原生 harvest (slot={slot_id}, action={action})"
+                    )
+                solve_result = await self._run_with_timeout(
+                    self._execute_native_harvest_on_tab(
+                        resident_info, project_id, action
+                    ),
+                    timeout_seconds=max(self._solve_timeout_seconds, 120.0),
+                    label=f"{success_label}:{slot_id}:{project_id}:{action}:harvest",
+                )
+                token = str((solve_result or {}).get("token") or "").strip() or None
+                resident_info.last_harvest_session_id = (
+                    str((solve_result or {}).get("session_id") or "").strip() or None
+                )
+                resident_info.last_solve_used_native_harvest = True
+
+            if not token:
+                return None
+            browser_solve_count = await self._finalize_resident_solve_locked(
+                token=token,
+                slot_id=slot_id,
+                project_id=project_id,
+                action=action,
+                resident_info=resident_info,
+            )
+
+        duration_ms = (time.time() - start_time) * 1000
         debug_logger.log_info(
             "[BrowserCaptcha] ✅ Token生成成功"
             f"（slot={slot_id}, 耗时 {duration_ms:.0f}ms, "
@@ -11974,7 +13040,7 @@ class BrowserCaptchaService:
                 - VIDEO_GENERATION: 视频生成和视频放大
 
         Returns:
-            reCAPTCHA token字符串，如果获取失败返回None
+            reCAPTCHA token and its native Flow session id.
         """
 
         def finish_result(
@@ -12085,10 +13151,15 @@ class BrowserCaptchaService:
                 debug_logger.log_warning(
                     f"[BrowserCaptcha] 共享标签页池不可用，fallback 到传统模式 (project: {project_id}, token_id={token_id})"
                 )
-                legacy_token = await self._get_token_legacy(
+                legacy_token, legacy_session_id = await self._get_token_legacy(
                     project_id, action, token_id=token_id
                 )
-                return finish_result(legacy_token, None)
+                return finish_result(
+                    legacy_token,
+                    f"legacy:{legacy_session_id}"
+                    if legacy_token and legacy_session_id
+                    else None,
+                )
 
             debug_logger.log_info(
                 "[BrowserCaptcha] 共享标签页已分配 "
@@ -12113,44 +13184,13 @@ class BrowserCaptchaService:
                         f"[BrowserCaptcha] 共享标签页 cookie 绑定校验失败，准备重建 (slot={slot_id}, project={project_id}, token_id={token_id})"
                     )
 
-            if (
-                resident_info
-                and resident_info.tab
-                and not resident_info.recaptcha_ready
-            ):
-                debug_logger.log_warning(
-                    f"[BrowserCaptcha] 共享标签页未就绪，准备重建 cold slot={slot_id}, project={project_id}, token_id={token_id}"
+            if resident_info and not resident_info.recaptcha_ready:
+                debug_logger.log_info(
+                    f"[BrowserCaptcha] 共享标签页 reCAPTCHA 延迟初始化，继续按目标项目页取码 "
+                    f"(slot={slot_id}, project={project_id}, action={action})"
                 )
-                await self._mark_resident_slot_unavailable(
-                    slot_id,
-                    resident_info,
-                    reason=f"cold_slot:{project_id}",
-                )
-                await release_reserved_slot()
-                slot_id, resident_info = await self._rebuild_resident_tab(
-                    project_id,
-                    token_id=token_id,
-                    slot_id=slot_id,
-                    reserve_for_solve=True,
-                    return_slot_key=True,
-                )
-                reserved_slot_id = slot_id or None
-                if resident_info is None:
-                    debug_logger.log_warning(
-                        f"[BrowserCaptcha] cold slot 重建失败，升级为浏览器级恢复 (slot={slot_id}, project={project_id}, token_id={token_id})"
-                    )
-                    if await self._recover_browser_runtime(
-                        project_id, reason=f"cold_resident_tab:{slot_id or 'unknown'}"
-                    ):
-                        slot_id, resident_info = await self._ensure_resident_tab(
-                            project_id,
-                            token_id=token_id,
-                            reserve_for_solve=True,
-                            return_slot_key=True,
-                        )
-                        reserved_slot_id = slot_id or None
 
-            if resident_info and resident_info.recaptcha_ready and resident_info.tab:
+            if resident_info and resident_info.tab:
                 debug_logger.log_info(
                     f"[BrowserCaptcha] 从共享常驻标签页即时生成 token (slot={slot_id}, project={project_id}, action={action})..."
                 )
@@ -12374,12 +13414,17 @@ class BrowserCaptchaService:
             debug_logger.log_warning(
                 f"[BrowserCaptcha] 所有常驻方式失败，fallback 到传统模式 (project: {project_id}, token_id={token_id})"
             )
-            legacy_token = await self._get_token_legacy(
+            legacy_token, legacy_session_id = await self._get_token_legacy(
                 project_id, action, token_id=token_id
             )
             if legacy_token and slot_id:
                 self._resident_error_streaks.pop(slot_id, None)
-            return finish_result(legacy_token, None)
+            return finish_result(
+                legacy_token,
+                f"legacy:{legacy_session_id}"
+                if legacy_token and legacy_session_id
+                else None,
+            )
         finally:
             await release_reserved_slot()
 
@@ -12429,10 +13474,18 @@ class BrowserCaptchaService:
         )
         if not token:
             return None
+        solve_snapshot = self._take_solve_bundle_snapshot(token)
+        if solve_snapshot is not None:
+            return solve_snapshot
         resident_info = None
-        if slot_id:
+        harvest_session_id = None
+        if slot_id and slot_id.startswith("legacy:"):
+            harvest_session_id = slot_id.partition("legacy:")[2] or None
+        elif slot_id:
             async with self._resident_lock:
                 resident_info = self._resident_tabs.get(slot_id)
+            if resident_info:
+                harvest_session_id = resident_info.last_harvest_session_id
         if resident_info and not (
             isinstance(resident_info.session_cookies, dict)
             and resident_info.session_cookies
@@ -12466,6 +13519,7 @@ class BrowserCaptchaService:
             slot_id=slot_id,
             fingerprint=fingerprint,
             session_cookies=session_cookies,
+            session_id=harvest_session_id,
         )
 
     async def _create_resident_tab(
@@ -12504,9 +13558,8 @@ class BrowserCaptchaService:
                 label=f"resident_browser_create_context:{slot_id}",
                 create_timeout_seconds=self._navigation_timeout_seconds,
             )
-            browser_context_id = (
-                browser_context_id or self._extract_tab_browser_context_id(tab)
-            )
+            if browser_context_id is None and self.headless:
+                browser_context_id = self._extract_tab_browser_context_id(tab)
 
             # 等待页面加载完成（减少等待时间）
             page_loaded = False
@@ -12579,17 +13632,11 @@ class BrowserCaptchaService:
                 )
 
             # 等待 reCAPTCHA 加载
-            recaptcha_ready = await self._wait_for_recaptcha(tab)
-
-            if not recaptcha_ready:
-                debug_logger.log_error(
-                    f"[BrowserCaptcha] reCAPTCHA 加载失败 (slot={slot_id}, project={project_id}, token_id={token_id})"
-                )
-                await self._dispose_browser_context_quietly(browser_context_id)
-                await self._close_tab_quietly(tab)
-                return None
-
-            resident_info.recaptcha_ready = True
+            debug_logger.log_info(
+                f"[BrowserCaptcha] 引导页跳过 reCAPTCHA 预热，等待真实项目页按需初始化 "
+                f"(slot={slot_id}, project={project_id}, token_id={token_id})"
+            )
+            resident_info.recaptcha_ready = False
             resident_info.fingerprint = await self._refresh_last_fingerprint(tab)
             try:
                 await self._cache_session_cookies_for_computed(resident_info)
@@ -12682,7 +13729,7 @@ class BrowserCaptchaService:
         action: str = "IMAGE_GENERATION",
         *,
         token_id: Optional[int] = None,
-    ) -> Optional[str]:
+    ) -> tuple[Optional[str], Optional[str]]:
         """传统模式获取 reCAPTCHA token（每次创建新标签页）
 
         Args:
@@ -12712,9 +13759,10 @@ class BrowserCaptchaService:
                         label=f"legacy_browser_create_context:{project_id}",
                         create_timeout_seconds=self._navigation_timeout_seconds,
                     )
-                    browser_context_id = (
-                        browser_context_id or self._extract_tab_browser_context_id(tab)
-                    )
+                    if browser_context_id is None and self.headless:
+                        browser_context_id = (
+                            self._extract_tab_browser_context_id(tab)
+                        )
                     legacy_info = ResidentTabInfo(
                         tab,
                         slot_id=f"legacy-{project_id}",
@@ -12735,7 +13783,7 @@ class BrowserCaptchaService:
                         debug_logger.log_error(
                             "[BrowserCaptcha] [Legacy] 打开 labs 引导页失败"
                         )
-                        return None
+                        return None, None
 
                     warmup_ok = await self._warmup_google_context_cookies(
                         legacy_info,
@@ -12754,17 +13802,63 @@ class BrowserCaptchaService:
                         debug_logger.log_error(
                             "[BrowserCaptcha] [Legacy] reCAPTCHA 无法加载"
                         )
-                        return None
+                        return None, None
 
-                    # 执行 reCAPTCHA
-                    debug_logger.log_info(
-                        f"[BrowserCaptcha] [Legacy] 执行 reCAPTCHA 验证 (action: {action})..."
+                    solve_mode = self._personal_solve_mode(action, legacy_info)
+                    auto_mode = (
+                        str(
+                            getattr(config, "personal_solve_strategy", "auto") or "auto"
+                        )
+                        == "auto"
                     )
-                    token = await self._run_with_timeout(
-                        self._execute_recaptcha_on_tab(tab, action),
-                        timeout_seconds=self._solve_timeout_seconds,
-                        label=f"legacy_solve:{project_id}:{action}",
-                    )
+                    legacy_info.last_harvest_session_id = None
+                    token = None
+                    session_id = None
+
+                    if solve_mode == "direct":
+                        debug_logger.log_info(
+                            f"[BrowserCaptcha] [Legacy] trusted JS 执行 reCAPTCHA "
+                            f"(action: {action})..."
+                        )
+                        direct_result = await self._run_with_timeout(
+                            self._execute_recaptcha_on_tab(
+                                tab, action, project_id=project_id
+                            ),
+                            timeout_seconds=self._solve_timeout_seconds + 12.0,
+                            label=f"legacy_direct_solve:{project_id}:{action}",
+                        )
+                        token = str(
+                            (direct_result or {}).get("token") or ""
+                        ).strip() or None
+                        session_id = (
+                            str(
+                                (direct_result or {}).get("session_id") or ""
+                            ).strip()
+                            or None
+                        )
+
+                    if (
+                        not token
+                        and str(action or "").strip().upper() == "CHAT_GENERATION"
+                        and (solve_mode == "harvest" or auto_mode)
+                    ):
+                        debug_logger.log_info(
+                            f"[BrowserCaptcha] [Legacy] 触发页面原生 harvest "
+                            f"(action: {action})..."
+                        )
+                        solve_result = await self._run_with_timeout(
+                            self._execute_native_harvest_on_tab(
+                                legacy_info, project_id, action
+                            ),
+                            timeout_seconds=max(self._solve_timeout_seconds, 120.0),
+                            label=f"legacy_native_solve:{project_id}:{action}",
+                        )
+                        token = str((solve_result or {}).get("token") or "") or None
+                        session_id = (
+                            str((solve_result or {}).get("session_id") or "").strip()
+                            or None
+                        )
+                    legacy_info.last_harvest_session_id = session_id
 
                     duration_ms = (time.time() - start_time) * 1000
 
@@ -12782,6 +13876,18 @@ class BrowserCaptchaService:
                                 f"[BrowserCaptcha] [Legacy] 提取 session cookies 失败 "
                                 f"(project={project_id}, token_id={token_id}): {cookie_error}"
                             )
+                        self._remember_solve_bundle_snapshot(
+                            self._build_solve_bundle(
+                                token=token,
+                                project_id=project_id,
+                                action=action,
+                                token_id=token_id,
+                                slot_id=f"legacy:{session_id}" if session_id else None,
+                                fingerprint=self.get_last_fingerprint(),
+                                session_cookies=legacy_info.session_cookies,
+                                session_id=session_id,
+                            )
+                        )
                         debug_logger.log_info(
                             "[BrowserCaptcha] [Legacy] ✅ Token获取成功"
                             f"（耗时 {duration_ms:.0f}ms, browser_solve_count={browser_solve_count}）"
@@ -12791,12 +13897,12 @@ class BrowserCaptchaService:
                             token_id=token_id,
                             source="legacy_solve_success",
                         )
-                        return token
+                        return token, session_id
 
                     debug_logger.log_error(
                         "[BrowserCaptcha] [Legacy] Token获取失败（返回null）"
                     )
-                    return None
+                    return None, None
 
                 except Exception as e:
                     if attempt < (max_attempts - 1) and self._is_browser_runtime_error(
@@ -12813,14 +13919,14 @@ class BrowserCaptchaService:
                     debug_logger.log_error(
                         f"[BrowserCaptcha] [Legacy] 获取token异常: {str(e)}"
                     )
-                    return None
+                    return None, None
                 finally:
                     # 关闭 legacy 临时标签页（但保留浏览器）
                     if tab:
                         await self._dispose_browser_context_quietly(browser_context_id)
                         await self._close_tab_quietly(tab)
 
-        return None
+        return None, None
 
     def get_last_fingerprint(self) -> Optional[Dict[str, Any]]:
         """返回最近一次打码时的浏览器指纹快照。"""
@@ -12949,231 +14055,73 @@ class BrowserCaptchaService:
             "请在打开的浏览器中登录账号。登录完成后，无需关闭浏览器，脚本下次运行时会自动使用此状态。"
         )
 
-    # ========== Session Token 刷新 ==========
-
-    async def refresh_session_token(
-        self, project_id: str, token_id: Optional[int] = None
-    ) -> Optional[str]:
-        """从常驻标签页获取最新的 Session Token
-        
-        复用共享打码标签页，通过刷新页面并从 cookies 中提取
-        __Secure-next-auth.session-token
-        
-        Args:
-            project_id: 项目ID，用于定位常驻标签页
-            
-        Returns:
-            新的 Session Token，如果获取失败返回 None
-        """
-        for attempt in range(2):
-            self._mark_runtime_active()
-            # 确保浏览器已初始化
-            await self.initialize()
-
-            start_time = time.time()
-            debug_logger.log_info(
-                f"[BrowserCaptcha] 开始刷新 Session Token (project: {project_id}, token_id={token_id}, attempt={attempt + 1})..."
-            )
-
-            async with self._resident_lock:
-                slot_id, resident_info = self._resolve_resident_slot_for_project_locked(
-                    project_id,
-                    token_id=token_id,
+    async def refresh_google_cookies(
+        self, project_id: Optional[str], *, token_id: int
+    ) -> Dict[str, Any]:
+        """Export current Google/Flow Cookies from the reserved account context."""
+        if not token_id:
+            raise ValueError("Cookie 刷新必须指定 Token ID")
+        self._mark_runtime_active()
+        await self.initialize()
+        slot_id, resident_info = await self._ensure_resident_tab(
+            project_id, token_id=token_id, reserve_for_solve=True, return_slot_key=True
+        )
+        consumed = False
+        try:
+            if not slot_id or not resident_info or not resident_info.tab:
+                raise RuntimeError("账号浏览器标签页不可用")
+            async with resident_info.solve_lock:
+                await self._consume_resident_slot_reservation(slot_id, resident_info)
+                consumed = True
+                if not await self._apply_token_cookie_binding(
+                    resident_info, token_id, label="cookie_refresh", acquire_lock=False
+                ):
+                    raise RuntimeError("账号浏览器 Cookie 绑定失败")
+                if resident_info.token_id != int(token_id):
+                    raise RuntimeError("浏览器标签页绑定的 Token 不一致")
+                resident_info.recaptcha_ready = False
+                tab = resident_info.tab
+                await self._tab_get(
+                    tab, "https://flow.google.com/projects", label="cookie_refresh_page"
                 )
-
-            if resident_info is None or not slot_id:
-                slot_id, resident_info = await self._ensure_resident_tab(
-                    project_id,
-                    token_id=token_id,
-                    return_slot_key=True,
-                )
-
-            if resident_info is None or not slot_id:
-                if attempt == 0 and not await self._probe_browser_runtime():
-                    await self._recover_browser_runtime(
-                        project_id, reason="refresh_session_prepare"
-                    )
-                    continue
-                debug_logger.log_warning(
-                    f"[BrowserCaptcha] 无法为 project_id={project_id} 获取共享常驻标签页"
-                )
-                return None
-
-            if not resident_info or not resident_info.tab:
-                debug_logger.log_error(f"[BrowserCaptcha] 无法获取常驻标签页")
-                return None
-
-            if not await self._ensure_resident_token_binding(
-                resident_info,
-                token_id,
-                label=f"refresh_session:{slot_id}",
-            ):
-                debug_logger.log_warning(
-                    f"[BrowserCaptcha] 刷新 Session Token 前 cookie 绑定未就绪，尝试重建 (slot={slot_id}, project={project_id}, token_id={token_id})"
-                )
-                slot_id, resident_info = await self._rebuild_resident_tab(
-                    project_id,
-                    token_id=token_id,
-                    slot_id=slot_id,
-                    return_slot_key=True,
-                )
-                if not resident_info or not slot_id or not resident_info.tab:
-                    if attempt == 0 and not await self._probe_browser_runtime():
-                        await self._recover_browser_runtime(
-                            project_id, reason="refresh_session_rebuild_cookie_binding"
-                        )
-                        continue
-                    return None
-
-            tab = resident_info.tab
-
-            try:
-                async with resident_info.solve_lock:
-                    # 刷新页面以获取最新的 cookies
-                    debug_logger.log_info(
-                        f"[BrowserCaptcha] 刷新常驻标签页以获取最新 cookies..."
-                    )
-                    resident_info.recaptcha_ready = False
-                    await self._run_with_timeout(
-                        self._tab_reload(
+                identity = None
+                for _ in range(30):
+                    try:
+                        identity = await self._tab_evaluate(
                             tab,
-                            label=f"refresh_session_reload:{slot_id}",
-                        ),
-                        timeout_seconds=self._session_refresh_timeout_seconds,
-                        label=f"refresh_session_reload_total:{slot_id}",
-                    )
-
-                    # 等待页面加载完成
-                    for _ in range(30):
-                        await asyncio.sleep(1)
-                        try:
-                            ready_state = await self._tab_evaluate(
-                                tab,
-                                "document.readyState",
-                                label=f"refresh_session_ready_state:{slot_id}",
-                                timeout_seconds=2.0,
-                            )
-                            if ready_state == "complete":
-                                break
-                        except Exception:
-                            pass
-
-                    resident_info.recaptcha_ready = await self._wait_for_recaptcha(tab)
-                    if not resident_info.recaptcha_ready:
-                        debug_logger.log_warning(
-                            f"[BrowserCaptcha] 刷新 Session Token 后 reCAPTCHA 未恢复就绪 (slot={slot_id})"
+                            "({host: location.hostname, ready: document.readyState, email: (window.WIZ_global_data || {}).oPEP7c || ''})",
+                            label="cookie_refresh_identity", timeout_seconds=2.0,
+                            return_by_value=True,
                         )
-
-                    # 额外等待确保 cookies 已设置
-                    await asyncio.sleep(2)
-
-                    # 从 cookies 中提取 __Secure-next-auth.session-token
-                    session_token = None
-
-                    try:
-                        cookies = await self._get_browser_cookies(
-                            label=f"refresh_session_get_cookies:{slot_id}",
-                            browser_context_id=resident_info.browser_context_id,
-                        )
-
-                        for cookie in cookies:
-                            if cookie.name == "__Secure-next-auth.session-token":
-                                session_token = cookie.value
-                                break
-
-                    except Exception as e:
-                        debug_logger.log_warning(
-                            f"[BrowserCaptcha] 通过 cookies API 获取失败: {e}，尝试从 document.cookie 获取..."
-                        )
-
-                        try:
-                            all_cookies = await self._tab_evaluate(
-                                tab,
-                                "document.cookie",
-                                label=f"refresh_session_document_cookie:{slot_id}",
-                            )
-                            if all_cookies:
-                                for part in all_cookies.split(";"):
-                                    part = part.strip()
-                                    if part.startswith(
-                                        "__Secure-next-auth.session-token="
-                                    ):
-                                        session_token = part.split("=", 1)[1]
-                                        break
-                        except Exception as e2:
-                            debug_logger.log_error(
-                                f"[BrowserCaptcha] document.cookie 获取失败: {e2}"
-                            )
-
-                duration_ms = (time.time() - start_time) * 1000
-
-                if session_token:
-                    resident_info.last_used_at = time.time()
-                    self._remember_project_affinity(project_id, slot_id, resident_info)
-                    self._remember_token_affinity(token_id, slot_id, resident_info)
-                    self._resident_error_streaks.pop(slot_id, None)
-                    self._mark_browser_health(True)
-                    debug_logger.log_info(
-                        f"[BrowserCaptcha] ✅ Session Token 获取成功（耗时 {duration_ms:.0f}ms）"
-                    )
-                    return session_token
-
-                debug_logger.log_error(
-                    f"[BrowserCaptcha] ❌ 未找到 __Secure-next-auth.session-token cookie"
+                        if isinstance(identity, dict) and identity.get("ready") == "complete":
+                            break
+                    except Exception:
+                        identity = None
+                    await asyncio.sleep(0.3)
+                if not isinstance(identity, dict) or identity.get("ready") != "complete":
+                    raise TimeoutError("Flow Cookie 刷新页面加载超时")
+                if identity.get("host") != "flow.google.com" or not identity.get("email"):
+                    raise RuntimeError("Flow 登录已失效，请重新同步 Google Cookies")
+                cookies = await self._get_browser_cookies(
+                    label="cookie_refresh_export",
+                    browser_context_id=resident_info.browser_context_id,
                 )
-                return None
-
-            except Exception as e:
-                debug_logger.log_error(
-                    f"[BrowserCaptcha] 刷新 Session Token 异常: {str(e)}"
-                )
-
-                if attempt == 0 and self._is_browser_runtime_error(e):
-                    if await self._recover_browser_runtime(
-                        project_id, reason=f"refresh_session:{slot_id}"
-                    ):
+                serialized = []
+                for cookie in cookies or []:
+                    item = self._serialize_browser_cookie_for_storage(cookie)
+                    if not item:
                         continue
-
-                slot_id, resident_info = await self._rebuild_resident_tab(
-                    project_id,
-                    token_id=token_id,
-                    slot_id=slot_id,
-                    return_slot_key=True,
-                )
-                if resident_info and slot_id:
-                    try:
-                        async with resident_info.solve_lock:
-                            cookies = await self._get_browser_cookies(
-                                label=f"refresh_session_get_cookies_after_rebuild:{slot_id}",
-                                browser_context_id=resident_info.browser_context_id,
-                            )
-                        for cookie in cookies:
-                            if cookie.name == "__Secure-next-auth.session-token":
-                                resident_info.last_used_at = time.time()
-                                self._remember_project_affinity(
-                                    project_id, slot_id, resident_info
-                                )
-                                self._remember_token_affinity(
-                                    token_id, slot_id, resident_info
-                                )
-                                self._resident_error_streaks.pop(slot_id, None)
-                                self._mark_browser_health(True)
-                                debug_logger.log_info(
-                                    f"[BrowserCaptcha] ✅ 重建后 Session Token 获取成功"
-                                )
-                                return cookie.value
-                    except Exception as rebuild_error:
-                        if attempt == 0 and self._is_browser_runtime_error(
-                            rebuild_error
-                        ):
-                            if await self._recover_browser_runtime(
-                                project_id, reason=f"refresh_session_rebuild:{slot_id}"
-                            ):
-                                continue
-
-                return None
-
-        return None
+                    host = str(item.get("domain") or urlparse(item.get("url", "")).hostname or "").lstrip(".")
+                    if host == "google.com" or host.endswith(".google.com"):
+                        serialized.append(item)
+                # The manager validates this candidate before committing it; no blind DB writes.
+                return {
+                    "google_cookies": json.dumps(serialized, ensure_ascii=False, separators=(",", ":")),
+                    "email": identity.get("email", ""),
+                }
+        finally:
+            if slot_id and not consumed:
+                await self._release_resident_slot_reservation(slot_id, resident_info)
 
     async def warmup_resident_tabs(
         self,
@@ -13504,6 +14452,7 @@ class _PersonalBrowserPoolService:
         self._worker_dispatch_reservations: dict[int, int] = {}
         self._project_worker_affinity: dict[str, int] = {}
         self._token_worker_affinity: dict[str, int] = {}
+        self._native_session_workers: dict[str, tuple[int, float]] = {}
         self._affinity_cache_limit = 256
         self._last_successful_worker_index: Optional[int] = None
         self._idle_worker_reaper_task: Optional[asyncio.Task] = None
@@ -13954,6 +14903,47 @@ class _PersonalBrowserPoolService:
             for key, value in self._token_worker_affinity.items()
             if value in valid_indexes
         }
+        self._native_session_workers = {
+            session_id: (worker_index, expires_at)
+            for session_id, (worker_index, expires_at) in self._native_session_workers.items()
+            if worker_index in valid_indexes and expires_at > time.monotonic()
+        }
+
+    def _remember_native_session_worker(
+        self, session_id: Optional[str], worker_index: Optional[int]
+    ) -> None:
+        normalized_session = str(session_id or "").strip()
+        if (
+            not normalized_session
+            or worker_index is None
+            or not (0 <= worker_index < len(self._workers))
+        ):
+            return
+        now = time.monotonic()
+        self._native_session_workers = {
+            key: value
+            for key, value in self._native_session_workers.items()
+            if value[1] > now
+        }
+        self._native_session_workers[normalized_session] = (
+            worker_index,
+            now + 300.0,
+        )
+        while len(self._native_session_workers) > 256:
+            oldest_key = next(iter(self._native_session_workers), None)
+            if oldest_key is None:
+                break
+            self._native_session_workers.pop(oldest_key, None)
+
+    def _take_native_session_worker(self, session_id: Optional[str]) -> Optional[int]:
+        normalized_session = str(session_id or "").strip()
+        if not normalized_session:
+            return None
+        entry = self._native_session_workers.pop(normalized_session, None)
+        if entry is None or entry[1] <= time.monotonic():
+            return None
+        worker_index = entry[0]
+        return worker_index if 0 <= worker_index < len(self._workers) else None
 
     def _worker_has_project_mapping(
         self,
@@ -15025,9 +16015,64 @@ class _PersonalBrowserPoolService:
                     slot_id=slot_id,
                     worker_index=worker_index,
                 )
+            self._remember_native_session_worker(
+                solve_bundle.get("session_id"), worker_index
+            )
             return solve_bundle
 
         return None
+
+    async def generate_native_image(
+        self,
+        *,
+        project_id: str,
+        prompt: str,
+        token_id: Optional[int],
+        timeout: int,
+    ) -> Optional[Dict[str, Any]]:
+        await self._ensure_workers()
+        worker_index = None
+        try:
+            worker_index, worker = await self._acquire_worker(
+                project_id=project_id,
+                token_id=token_id,
+                ensure_workers=False,
+            )
+            result = await worker.generate_native_image(
+                project_id=project_id,
+                prompt=prompt,
+                token_id=token_id,
+                timeout=timeout,
+            )
+            if isinstance(result, dict):
+                self._remember_native_session_worker(
+                    result.get("session_id"), worker_index
+                )
+            return result
+        finally:
+            await self._release_worker_reservation(worker_index)
+
+    async def submit_native_stream_chat(
+        self,
+        *,
+        project_id: str,
+        prompt: str,
+        recaptcha_token: str,
+        session_id: str,
+        timeout: int,
+    ) -> Dict[str, Any]:
+        """Route a session-bound StreamChat submission to its owning worker."""
+        await self._ensure_workers()
+        worker_index = self._take_native_session_worker(session_id)
+        if worker_index is None:
+            raise RuntimeError("personal StreamChat session worker is unavailable")
+        return await self._workers[worker_index].submit_native_stream_chat(
+            project_id=project_id,
+            prompt=prompt,
+            recaptcha_token=recaptcha_token,
+            session_id=session_id,
+            timeout=timeout,
+        )
 
     async def get_token(
         self,
@@ -15188,6 +16233,7 @@ class _PersonalBrowserPoolService:
         error_message: str = "",
         token_id: Optional[int] = None,
         slot_id: Optional[str] = None,
+        issued_at: Optional[float] = None,
     ):
         await self._ensure_workers()
         exact_worker_index = self._parse_worker_index_from_slot_id(slot_id)
@@ -15200,6 +16246,7 @@ class _PersonalBrowserPoolService:
                 error_message=error_message,
                 token_id=token_id,
                 slot_id=slot_id,
+                issued_at=issued_at,
             )
             return
 
@@ -15234,6 +16281,7 @@ class _PersonalBrowserPoolService:
                 error_message=error_message,
                 token_id=token_id,
                 slot_id=slot_id,
+                issued_at=issued_at,
             )
 
     async def invalidate_token(self, project_id: str):
@@ -15310,43 +16358,35 @@ class _PersonalBrowserPoolService:
                         return warmed_slots
         return warmed_slots
 
-    async def refresh_session_token(
-        self, project_id: str, token_id: Optional[int] = None
-    ) -> Optional[str]:
+    async def refresh_google_cookies(
+        self, project_id: Optional[str], *, token_id: int
+    ) -> Dict[str, Any]:
+        if not token_id:
+            raise ValueError("Cookie 刷新必须指定 Token ID")
         await self._ensure_workers()
         excluded_indexes: set[int] = set()
-        max_attempts = min(len(self._workers), 3)
-
-        for _ in range(max_attempts):
+        last_error = None
+        for _ in range(min(len(self._workers), 3)):
             worker_index = None
-            worker = None
             try:
                 worker_index, worker = await self._acquire_worker(
-                    project_id=project_id,
-                    token_id=token_id,
+                    project_id=project_id, token_id=token_id,
                     excluded_indexes=excluded_indexes,
                 )
                 excluded_indexes.add(worker_index)
-                session_token = await worker.refresh_session_token(
-                    project_id, token_id=token_id
-                )
-            except Exception as e:
-                worker_label = (
-                    worker_index + 1 if worker_index is not None else "unknown"
-                )
-                debug_logger.log_warning(
-                    f"[BrowserCaptchaPool] Session Token 刷新失败，尝试切换其他实例 (worker={worker_label}): {e}"
-                )
-                continue
-            finally:
-                await self._release_worker_reservation(worker_index)
-            if session_token:
+                result = await worker.refresh_google_cookies(project_id, token_id=token_id)
                 self._last_successful_worker_index = worker_index
                 self._remember_affinity(
                     project_id=project_id, token_id=token_id, worker_index=worker_index
                 )
-                return session_token
-        return None
+                return result
+            except Exception as exc:
+                last_error = exc
+            finally:
+                await self._release_worker_reservation(worker_index)
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("账号浏览器 Cookie 刷新失败：没有可用实例")
 
     async def start_resident_mode(self, project_id: str):
         await self._ensure_workers()

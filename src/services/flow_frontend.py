@@ -1,20 +1,41 @@
 """Current flow.google.com frontend RPC transport and response adapters."""
 
 import json
+import contextvars
 import random
 import re
 import uuid
+from http.cookiejar import CookieJar
 from typing import Any, Dict, List, Optional
-from urllib.parse import quote, urlencode, urlparse
+from urllib.parse import quote, urlencode, urlparse, urljoin
 
-from curl_cffi.requests import AsyncSession
+from curl_cffi import CurlInfo, CurlOpt
+from curl_cffi.requests import AsyncSession, Cookies
+from curl_cffi.requests.cookies import CurlMorsel
 
 from ..core.logger import debug_logger
 from .browser_cookie_utils import serialize_cookie_header_for_url
+from .flow_cookies import FlowCookieJar
 
 
 class FlowFrontendMixin:
     """Frontend RPC helpers shared by project and media generation flows."""
+
+    def get_updated_flow_cookies(self, original: Optional[str]) -> str:
+        """Return the latest matching cookie snapshot in this async context."""
+        storage = str(original or "").strip()
+        context = getattr(self, "_flow_cookie_storage_ctx", None)
+        snapshot = context.get() if context is not None else None
+        if snapshot and storage in snapshot:
+            return snapshot[1]
+        return storage
+
+    def _remember_flow_cookies(self, original: str, cookie_jar: FlowCookieJar) -> None:
+        if not hasattr(self, "_flow_cookie_storage_ctx"):
+            self._flow_cookie_storage_ctx = contextvars.ContextVar(
+                "flow_cookie_storage", default=None
+            )
+        self._flow_cookie_storage_ctx.set((original, cookie_jar.export_storage()))
 
     STREAM_CHAT_RPC_PATH = (
         "/_/AiSandboxAngularFrontend/data/"
@@ -207,7 +228,6 @@ class FlowFrontendMixin:
             None,
             client_context,
             [[[prompt]]],
-            None,
             None,
             None,
             None,
@@ -541,9 +561,10 @@ class FlowFrontendMixin:
                 else str((previous or {}).get("mediaName") or operation_id)
             )
             video_url = cls._find_flow_content_url(record, "video")
-            status = (
-                "MEDIA_GENERATION_STATUS_SUCCESSFUL"
-                if video_url
+            error_code = cls._extract_frontend_rpc_error_code(record)
+            status = "MEDIA_GENERATION_STATUS_SUCCESSFUL" if video_url else (
+                "MEDIA_GENERATION_STATUS_FAILED"
+                if error_code
                 else "MEDIA_GENERATION_STATUS_ACTIVE"
             )
             metadata = dict(previous_operation.get("metadata") or {})
@@ -565,9 +586,21 @@ class FlowFrontendMixin:
                 previous.get("modelKey") if isinstance(previous, dict) else None,
             )
             metadata["video"] = video_info
+            error_message = {
+                "PUBLIC_ERROR_PROMINENT_PEOPLE_FILTER_FAILED": (
+                    "提示词或参考素材触发了人物安全过滤"
+                ),
+                "PUBLIC_ERROR_UNSAFE_GENERATION": "提示词或参考素材触发了内容安全过滤",
+            }.get(error_code, f"Flow 上游拒绝视频生成：{error_code}")
+            operation_body = {"name": operation_id, "metadata": metadata}
+            if error_code:
+                operation_body["error"] = {
+                    "code": error_code,
+                    "message": error_message,
+                }
             normalized.append(
                 {
-                    "operation": {"name": operation_id, "metadata": metadata},
+                    "operation": operation_body,
                     "name": operation_id,
                     "mediaName": media_name,
                     "projectId": (
@@ -580,13 +613,58 @@ class FlowFrontendMixin:
                     "frontendRpc": "jwpduf",
                 }
             )
+        if not normalized:
+            error_code = cls._extract_frontend_rpc_error_code(payload)
+            if error_code:
+                error_message = f"Flow 上游拒绝视频生成：{error_code}"
+                for previous in operations:
+                    operation_id = str(
+                        (previous or {}).get("name")
+                        or ((previous or {}).get("operation") or {}).get("name")
+                        or ""
+                    )
+                    normalized.append(
+                        {
+                            **previous,
+                            "operation": {
+                                **((previous or {}).get("operation") or {}),
+                                "name": operation_id,
+                                "error": {
+                                    "code": error_code,
+                                    "message": error_message,
+                                },
+                            },
+                            "status": "MEDIA_GENERATION_STATUS_FAILED",
+                            "progress": 45,
+                            "frontendRpc": "jwpduf",
+                        }
+                    )
         return {"operations": normalized or operations, "frontendRpc": "jwpduf"}
+
+    @staticmethod
+    def _update_flow_cookie_jar(cookie_jar: CookieJar, response: Any) -> None:
+        # A full libcurl snapshot also honors deletions and redirect Set-Cookie.
+        # The session's Python jar only merges cookies and can retain deleted ones.
+        refreshed = Cookies()
+        refreshed.update_cookies_from_curl(
+            [
+                CurlMorsel.from_curl_format(line)
+                for line in response.infos[CurlInfo.COOKIELIST]
+            ]
+        )
+        if isinstance(cookie_jar, FlowCookieJar):
+            cookie_jar.replace_snapshot(refreshed.jar, response)
+            return
+        cookie_jar.clear()
+        for cookie in refreshed.jar:
+            cookie_jar.set_cookie(cookie)
 
     async def _load_flow_frontend_bootstrap(
         self,
         page_url: str,
         cookie_header: str,
         timeout: int,
+        cookie_jar: Optional[CookieJar] = None,
     ) -> str:
         proxy_url = None
         if self.proxy_manager:
@@ -597,20 +675,44 @@ class FlowFrontendMixin:
         fingerprint = self.get_request_fingerprint() or {}
         if "proxy_url" in fingerprint:
             proxy_url = str(fingerprint.get("proxy_url") or "").strip() or None
+        if isinstance(cookie_jar, FlowCookieJar):
+            cookie_jar.add_runtime_cookies(fingerprint.get("session_cookies"), page_url)
         headers = {
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Cookie": cookie_header,
             "Referer": "https://flow.google.com/",
             "User-Agent": self._get_effective_request_user_agent(),
         }
-        async with AsyncSession(trust_env=False) as session:
-            response = await session.get(
-                page_url,
-                headers=headers,
-                proxy=proxy_url,
-                timeout=max(10, min(int(timeout or 30), 30)),
-                impersonate=self._resolve_runtime_impersonate(),
-            )
+        session_kwargs: Dict[str, Any] = {"trust_env": False}
+        if cookie_jar is not None:
+            session_kwargs.update(cookies=cookie_jar, curl_infos=[CurlInfo.COOKIELIST])
+            headers.pop("Cookie", None)
+        async with AsyncSession(**session_kwargs) as session:
+            for _ in range(10):
+                extra = (
+                    cookie_jar.extra_cookie_header(page_url)
+                    if isinstance(cookie_jar, FlowCookieJar) else ""
+                )
+                session.curl_options[CurlOpt.COOKIE] = extra
+                response = await session.get(
+                    page_url,
+                    headers=headers,
+                    proxy=proxy_url,
+                    timeout=max(10, min(int(timeout or 30), 30)),
+                    impersonate=self._resolve_runtime_impersonate(),
+                    allow_redirects=not bool(extra),
+                )
+                if cookie_jar is not None:
+                    self._update_flow_cookie_jar(cookie_jar, response)
+                location = response.headers.get("location")
+                if not extra or not (300 <= response.status_code < 400) or not location:
+                    break
+                page_url = urljoin(page_url, location)
+                redirect = urlparse(page_url)
+                if redirect.scheme != "https" or redirect.hostname != "flow.google.com":
+                    raise RuntimeError("Flow 登录认证失败：登录态被重定向")
+            else:
+                raise RuntimeError("Flow frontend bootstrap exceeded redirect limit")
         response_host = str(urlparse(str(response.url)).hostname or "").lower()
         if response.status_code in {401, 403} or (
             response_host and response_host != "flow.google.com"
@@ -646,11 +748,17 @@ class FlowFrontendMixin:
         )
         if not bootstrap_cookie_header:
             raise RuntimeError("Flow frontend RPC requires Google session cookies")
+        original_cookies = (
+            cookie_storage if str(cookie_storage or "").strip() else cookie_header
+        )
+        cookie_jar = FlowCookieJar(self.get_updated_flow_cookies(original_cookies))
         bootstrap_text = await self._load_flow_frontend_bootstrap(
             page_url,
             bootstrap_cookie_header,
             timeout,
+            cookie_jar=cookie_jar,
         )
+        self._remember_flow_cookies(original_cookies, cookie_jar)
         bootloader_match = re.search(
             r"boq_labs-ai-sandbox-frontend_[A-Za-z0-9_.-]+",
             bootstrap_text,
@@ -669,10 +777,8 @@ class FlowFrontendMixin:
             f"&f.sid={frontend_session_id}&hl=en"
             f"&_reqid={request_counter}&rt=c"
         )
-        rpc_cookie_header = (
-            serialize_cookie_header_for_url(cookie_storage, url)
-            if str(cookie_storage or "").strip()
-            else cookie_header
+        rpc_cookie_header = serialize_cookie_header_for_url(
+            cookie_jar.export_storage(), url
         )
         if not rpc_cookie_header:
             raise RuntimeError("Flow frontend RPC requires Google session cookies")
@@ -684,7 +790,7 @@ class FlowFrontendMixin:
             "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
             "Cookie": rpc_cookie_header,
             "Origin": "https://flow.google.com",
-            "Referer": f"https://flow.google.com{resolved_source_path}",
+            "Referer": "https://flow.google.com/",
             "sec-fetch-dest": "empty",
             "sec-fetch-mode": "cors",
             "sec-fetch-site": "same-origin",
@@ -693,7 +799,11 @@ class FlowFrontendMixin:
         f_request = self._compact_json_dumps(
             [[[rpc_id, self._compact_json_dumps(argument), None, "generic"]]]
         )
-        request_body = urlencode({"f.req": f_request})
+        request_fields = {"f.req": f_request}
+        at_token = self._extract_stream_chat_at_token(bootstrap_text)
+        if at_token:
+            request_fields["at"] = at_token
+        request_body = urlencode(request_fields)
         response_text = await self._make_text_request(
             method="POST",
             url=url,
@@ -703,18 +813,21 @@ class FlowFrontendMixin:
             apply_default_client_headers=False,
             return_error_response=True,
             redact_sensitive_logs=True,
+            cookie_jar=cookie_jar,
         )
-        xsrf_match = re.search(r'\["xsrf","([^"]+)"', response_text)
+        xsrf_match = re.search(r'\["xsrf"\s*,\s*"((?:\\.|[^"\\])*)"', response_text)
         if xsrf_match:
+            request_fields["at"] = json.loads('"' + xsrf_match.group(1) + '"')
             response_text = await self._make_text_request(
                 method="POST",
                 url=url,
                 headers=headers,
-                raw_body=request_body + "&at=" + quote(xsrf_match.group(1), safe=""),
+                raw_body=urlencode(request_fields),
                 timeout=timeout,
                 apply_default_client_headers=False,
                 return_error_response=True,
                 redact_sensitive_logs=True,
+                cookie_jar=cookie_jar,
             )
 
         frames = self._parse_batchexecute_frames(response_text)
@@ -722,18 +835,22 @@ class FlowFrontendMixin:
         payload = self._extract_batchexecute_payload(frames, rpc_id)
         if payload is None:
             raise RuntimeError(f"Flow frontend RPC returned no payload: rpc={rpc_id}")
+        self._remember_flow_cookies(original_cookies, cookie_jar)
         return payload
 
     @staticmethod
     def _extract_stream_chat_at_token(bootstrap_text: str) -> str:
         """从 bootstrap HTML 提取 WIZ_global_data.SNlM0e（XSRF at token）。"""
         for pattern in (
-            r'"SNlM0e":"([^"]+)"',
+            r'"SNlM0e"\s*:\s*"((?:\\.|[^"\\])+)"',
             r"SNlM0e['\"]?\s*[:=]\s*['\"]([A-Za-z0-9_:\-.]+)['\"]",
         ):
             match = re.search(pattern, bootstrap_text)
             if match:
-                return match.group(1)
+                try:
+                    return json.loads('"' + match.group(1) + '"')
+                except ValueError:
+                    return match.group(1)
         return ""
 
     def _build_stream_chat_request(
@@ -753,7 +870,7 @@ class FlowFrontendMixin:
         inner = [
             str(session_id),
             [[[[str(prompt)]]]],
-            [f"projects/{project_id}", None, [recaptcha_token, 1], None, None, 3],
+            [f"projects/{project_id}", None, [recaptcha_token, 1], None, None, 1],
         ]
         return self._compact_json_dumps(
             [None, self._compact_json_dumps(inner)]
@@ -822,11 +939,17 @@ class FlowFrontendMixin:
         )
         if not bootstrap_cookie_header:
             raise RuntimeError("Flow StreamChat requires Google session cookies")
+        original_cookies = (
+            cookie_storage if str(cookie_storage or "").strip() else cookie_header
+        )
+        cookie_jar = FlowCookieJar(self.get_updated_flow_cookies(original_cookies))
         bootstrap_text = await self._load_flow_frontend_bootstrap(
             page_url,
             bootstrap_cookie_header,
             timeout,
+            cookie_jar=cookie_jar,
         )
+        self._remember_flow_cookies(original_cookies, cookie_jar)
         bootloader_match = re.search(
             r"boq_labs-ai-sandbox-frontend_[A-Za-z0-9_.-]+",
             bootstrap_text,
@@ -844,10 +967,8 @@ class FlowFrontendMixin:
             f"&f.sid={session_match.group(1)}&hl=en"
             f"&_reqid={random.randint(100000, 999999)}&rt=c"
         )
-        rpc_cookie_header = (
-            serialize_cookie_header_for_url(cookie_storage, url)
-            if str(cookie_storage or "").strip()
-            else cookie_header
+        rpc_cookie_header = serialize_cookie_header_for_url(
+            cookie_jar.export_storage(), url
         )
         if not rpc_cookie_header:
             raise RuntimeError("Flow StreamChat requires Google session cookies")
@@ -887,6 +1008,7 @@ class FlowFrontendMixin:
             apply_default_client_headers=False,
             return_error_response=True,
             redact_sensitive_logs=True,
+            cookie_jar=cookie_jar,
         )
         frames = self._parse_batchexecute_frames(response_text)
         error_match = re.search(r"PUBLIC_ERROR_[A-Z_]+", response_text)
@@ -909,6 +1031,7 @@ class FlowFrontendMixin:
                 )
             )
         )
+        self._remember_flow_cookies(original_cookies, cookie_jar)
         return {
             "frames": frames,
             "mediaIds": media_ids,

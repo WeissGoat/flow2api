@@ -11,9 +11,9 @@ class Token(BaseModel):
     id: Optional[int] = None
 
     # 认证信息 (核心)
-    st: str  # Session Token (__Secure-next-auth.session-token)
-    at: Optional[str] = None  # Access Token (从ST转换而来)
-    at_expires: Optional[datetime] = None  # AT过期时间
+    st: str  # 登录态兼容标识；新版 Flow 使用完整 Google/Flow Cookies
+    at: Optional[str] = None  # 登录态验证后的兼容标识
+    at_expires: Optional[datetime] = None  # 下次登录态校验时间
 
     # 基础信息
     email: str
@@ -44,14 +44,14 @@ class Token(BaseModel):
     captcha_proxy_url: Optional[str] = None
     extension_route_key: Optional[str] = None
 
-    # 协议刷新 Session Token
+    # Google/Flow Cookie 刷新；保留旧字段名兼容已有数据
     protocol_mode: str = "session"  # session/protocol
     google_cookies: str = ""
     login_account: str = ""
     login_password: str = ""
     proxy_url: str = ""
     auto_refresh_enabled: bool = True
-    refresh_interval_minutes: int = 120
+    refresh_interval_minutes: int = 30
     last_st_refresh_at: Optional[datetime] = None
     last_st_refresh_result: str = ""
 
@@ -190,7 +190,7 @@ class CaptchaConfig(BaseModel):
 
     id: int = 1
     captcha_method: str = (
-        "yescaptcha"  # yescaptcha/captcharun/capsolver/ezcaptcha/browser/personal/remote_browser
+        "yescaptcha"  # yescaptcha/flow2api_team/captcharun/twocaptcha/capsolver/ezcaptcha/browser/personal/remote_browser
     )
     yescaptcha_api_key: str = ""
     yescaptcha_base_url: str = "https://api.yescaptcha.com"
@@ -203,6 +203,8 @@ class CaptchaConfig(BaseModel):
     capsolver_base_url: str = "https://api.capsolver.com"
     captcharun_api_key: str = ""
     captcharun_base_url: str = "https://api.captcha-run.com"
+    twocaptcha_api_key: str = ""
+    twocaptcha_base_url: str = "https://api.2captcha.com"
     remote_browser_base_url: str = ""
     remote_browser_api_key: str = ""
     remote_browser_timeout: int = 60
@@ -238,7 +240,7 @@ class TokenRefreshConfig(BaseModel):
 
     id: int = 1
     enabled: bool = True
-    refresh_interval_minutes: int = 120
+    refresh_interval_minutes: int = 30
     updated_at: Optional[datetime] = None
 
 

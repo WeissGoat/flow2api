@@ -3,6 +3,7 @@ import unittest
 
 from src.core.config import config
 from src.core.database import Database
+from src.services.generation_handler import _video_poll_attempt_budget
 
 
 class GenerationConfigMaxRetriesTests(unittest.IsolatedAsyncioTestCase):
@@ -59,6 +60,14 @@ class GenerationConfigMaxRetriesTests(unittest.IsolatedAsyncioTestCase):
         await self.db.reload_config_to_memory()
 
         self.assertEqual(config.flow_max_retries, 9)
+
+    def test_video_poll_budget_uses_generation_timeout(self):
+        self.assertEqual(_video_poll_attempt_budget(600, 3), 200)
+        self.assertEqual(_video_poll_attempt_budget(1500, 3), 500)
+        self.assertEqual(
+            _video_poll_attempt_budget(600, 3, upsample=True),
+            600,
+        )
 
 
 if __name__ == "__main__":

@@ -13,6 +13,28 @@ YESCAPTCHA_TASK_TYPE_OPTIONS = {
     "RecaptchaV3TaskProxylessM1S9": 0.9,
 }
 
+# Flow2API 团队打码：内置服务，地址与密钥写死在代码里，不随配置/数据库改变。
+FLOW2API_TEAM_CAPTCHA_METHOD = "flow2api_team"
+FLOW2API_TEAM_CAPTCHA_BASE_URL = "https://captcha.haqimi.uk"
+FLOW2API_TEAM_CAPTCHA_CLIENT_KEY = "sk-flow-mint-2f9a7c1e4b8d6350"
+FLOW2API_TEAM_CAPTCHA_TASK_TYPE = "RecaptchaV3TaskProxylessM1S9"
+
+
+def normalize_captcha_method(method: Optional[str]) -> str:
+    """把打码方式收敛到内置支持的取值（未知值原样转小写返回）。"""
+    normalized = (method or "").strip().lower()
+    if normalized in {FLOW2API_TEAM_CAPTCHA_METHOD, "flow2api-team", "flow2apiteam"}:
+        return FLOW2API_TEAM_CAPTCHA_METHOD
+    return normalized or "yescaptcha"
+
+
+def is_yes_style_captcha_method(method: Optional[str]) -> bool:
+    """Flow2API 团队打码与 YesCaptcha 共用 createTask/getTaskResult 协议。"""
+    return normalize_captcha_method(method) in {
+        "yescaptcha",
+        FLOW2API_TEAM_CAPTCHA_METHOD,
+    }
+
 
 def normalize_yescaptcha_task_type(task_type: Optional[str]) -> str:
     normalized = (task_type or "").strip()
@@ -239,10 +261,6 @@ class Config:
         return self._config["flow"]["poll_interval"]
 
     @property
-    def max_poll_attempts(self) -> int:
-        return self._config["flow"]["max_poll_attempts"]
-
-    @property
     def server_host(self) -> str:
         return self._config["server"]["host"]
 
@@ -432,7 +450,7 @@ class Config:
 
     @property
     def browser_recaptcha_settle_seconds(self) -> float:
-        """有头打码在 reload/clr 就绪后的额外等待秒数。"""
+        """自定义站点分数测试在 reload/clr 就绪后的额外等待秒数。"""
         value = self._config.get("captcha", {}).get(
             "browser_recaptcha_settle_seconds", 3.0
         )
@@ -440,6 +458,25 @@ class Config:
             return max(0.0, min(10.0, float(value)))
         except Exception:
             return 3.0
+
+    @property
+    def browser_flow_page_warmup_seconds(self) -> float:
+        """browser harvest 打开真实 Flow 页面后的稳定等待秒数。"""
+        value = self._config.get("captcha", {}).get(
+            "browser_flow_page_warmup_seconds", 6.0
+        )
+        try:
+            return max(0.0, min(30.0, float(value)))
+        except Exception:
+            return 6.0
+
+    def set_browser_flow_page_warmup_seconds(self, value: float):
+        """设置 browser harvest 页面预热等待秒数。"""
+        if "captcha" not in self._config:
+            self._config["captcha"] = {}
+        self._config["captcha"]["browser_flow_page_warmup_seconds"] = max(
+            0.0, min(30.0, float(value))
+        )
 
     @property
     def browser_idle_ttl_seconds(self) -> int:
@@ -468,6 +505,23 @@ class Config:
             return max(1, min(20, int(value)))
         except Exception:
             return 6
+
+    @property
+    def personal_solve_strategy(self) -> str:
+        """personal 打码策略：direct 用 trusted JS，harvest 原生截获，auto 自动降级。"""
+        value = str(
+            self._config.get("captcha", {}).get("personal_solve_strategy", "auto")
+        ).strip().lower()
+        return value if value in {"direct", "harvest", "auto"} else "auto"
+
+    def set_personal_solve_strategy(self, value: str):
+        """设置 personal 打码策略。"""
+        normalized = str(value or "").strip().lower()
+        if normalized not in {"direct", "harvest", "auto"}:
+            normalized = "auto"
+        if "captcha" not in self._config:
+            self._config["captcha"] = {}
+        self._config["captcha"]["personal_solve_strategy"] = normalized
 
     @property
     def personal_max_resident_tabs(self) -> int:
@@ -680,6 +734,23 @@ class Config:
         if "captcha" not in self._config:
             self._config["captcha"] = {}
         self._config["captcha"]["captcharun_base_url"] = base_url
+
+    @property
+    def twocaptcha_api_key(self) -> str:
+        return self._config.get("captcha", {}).get("twocaptcha_api_key", "")
+
+    def set_twocaptcha_api_key(self, api_key: str):
+        self._config.setdefault("captcha", {})["twocaptcha_api_key"] = api_key
+
+    @property
+    def twocaptcha_base_url(self) -> str:
+        return (
+            self._config.get("captcha", {}).get("twocaptcha_base_url")
+            or "https://api.2captcha.com"
+        )
+
+    def set_twocaptcha_base_url(self, base_url: str):
+        self._config.setdefault("captcha", {})["twocaptcha_base_url"] = base_url
 
     @property
     def remote_browser_base_url(self) -> str:

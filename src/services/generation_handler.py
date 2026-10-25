@@ -4,6 +4,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import math
 import time
 from pathlib import Path
 from typing import Optional, AsyncGenerator, List, Dict, Any
@@ -19,6 +20,18 @@ from ..core.account_tiers import (
     supports_model_for_tier,
 )
 from .file_cache import FileCache
+
+
+def _video_poll_attempt_budget(
+    timeout_seconds: float,
+    poll_interval: float,
+    *,
+    upsample: bool = False,
+) -> int:
+    interval = max(0.1, float(poll_interval or 0))
+    timeout = max(interval, float(timeout_seconds or 0))
+    attempts = max(1, math.ceil(timeout / interval))
+    return attempts * (3 if upsample else 1)
 
 
 # Model configuration
@@ -111,18 +124,7 @@ MODEL_CONFIG = {
         "aspect_ratio": "IMAGE_ASPECT_RATIO_PORTRAIT_THREE_FOUR",
         "upsample": "UPSAMPLE_IMAGE_RESOLUTION_4K",
     },
-    # 图片生成 - IMAGEN_3_5 (Imagen 4.0)
-    "imagen-4.0-generate-preview-landscape": {
-        "type": "image",
-        "model_name": "IMAGEN_3_5",
-        "aspect_ratio": "IMAGE_ASPECT_RATIO_LANDSCAPE",
-    },
-    "imagen-4.0-generate-preview-portrait": {
-        "type": "image",
-        "model_name": "IMAGEN_3_5",
-        "aspect_ratio": "IMAGE_ASPECT_RATIO_PORTRAIT",
-    },
-    # 图片生成 - Nano Banana 2（本地补丁：Flow 2026-10 起模型键 NARWHAL → BELUGA）
+    # 图片生成 - BELUGA (Nano Banana 2.1)
     "gemini-3.1-flash-image-landscape": {
         "type": "image",
         "model_name": "BELUGA",
@@ -1113,21 +1115,28 @@ def _apply_current_flow_model_catalog():
     for config_entry in MODEL_CONFIG.values():
         config_entry["listed"] = False
 
-    # BELUGA（原 NARWHAL）是当前图片生成 RPC 的模型键。Older image
-    # aliases continue to resolve but no longer clutter the public catalog.
-    for model_id, config_entry in MODEL_CONFIG.items():
-        if (
-            config_entry.get("type") == "image"
-            and config_entry.get("model_name") == "BELUGA"
-        ):
-            config_entry["listed"] = True
-            config_entry["display_name"] = "Flow Image - Nano Banana 2"
-
     def register(model_id: str, config_entry: Dict[str, Any], display_name: str):
         config_entry = dict(config_entry)
         config_entry["listed"] = True
         config_entry["display_name"] = display_name
         MODEL_CONFIG[model_id] = config_entry
+
+    image_variants = [
+        (model_id, dict(entry)) for model_id, entry in MODEL_CONFIG.items()
+        if entry.get("type") == "image"
+        and model_id.startswith("gemini-3.1-flash-image-")
+        and entry.get("model_name") == "BELUGA"
+    ]
+    for model_id, entry in image_variants:
+        entry["model_name"] = "BELUGA"
+        register(model_id, entry, "Nano Banana 2.1")
+        lite_entry = dict(entry)
+        lite_entry["model_name"] = "HARBOR_SEAL"
+        register(
+            model_id.replace("gemini-3.1-flash-image-", "gemini-3.1-flash-lite-image-", 1),
+            lite_entry,
+            "Nano Banana 2 Lite",
+        )
 
     def t2v(model_key: str, aspect_ratio: str) -> Dict[str, Any]:
         return _make_t2v_config(
@@ -1467,28 +1476,29 @@ class GenerationHandler:
             str(operation.get("projectId") or video_info.get("projectId") or "").strip()
             or None
         )
+        media_name = (
+            operation.get("mediaName")
+            or video_info.get("mediaName")
+        )
         # as29s indexes by generation operation id, not mediaName; the two are
         # distinct UUIDs and the wrong one comes back as code=[5] (NOT_FOUND).
-        media_name = (
+        media_generation_id = (
             video_info.get("mediaGenerationId")
             or operation.get("name")
             or (operation.get("operation") or {}).get("name")
-            or operation.get("mediaName")
-            or video_info.get("mediaName")
         )
+        media_lookup_id = media_generation_id or media_name
 
-        video_url = ""
-        if media_name:
-            # jwpduf 轮询响应可能已携带带签名的 flow-content 直链（与图片路径一致），
-            # 直接复用；仅在没有直链时才通过 as29s 换取（部分模型如 abra 的
-            # media 名不被 as29s 接受，会返回 code=[5]）。
-            video_url = str(video_info.get("fifeUrl") or "").strip()
-        if not video_url and media_name:
+        # jwpduf 轮询响应可能已携带带签名的 flow-content 直链（与图片路径一致），
+        # 直接复用；仅在没有直链时才通过 as29s 换取（部分模型如 abra 的
+        # media 名不被 as29s 接受，会返回 code=[5]）。
+        video_url = str(video_info.get("fifeUrl") or "").strip()
+        if not video_url and media_lookup_id:
             video_url = (
                 await self.flow_client.get_media_url_redirect(
                     getattr(token, "st", ""),
-                media_name,
-                media_url_type="MEDIA_URL_TYPE_FULL_MEDIA",
+                    media_lookup_id,
+                    media_url_type="MEDIA_URL_TYPE_FULL_MEDIA",
                     google_cookies=getattr(token, "google_cookies", None),
                     token_id=getattr(token, "id", None),
                     project_id=project_id,
@@ -1502,11 +1512,11 @@ class GenerationHandler:
         video_media_id = (
             uuid_match.group(1)
             if uuid_match
-            else str(media_name or video_info.get("mediaGenerationId") or "")
+            else str(media_generation_id or media_lookup_id or "")
         )
 
         return {
-            "media_name": media_name,
+            "media_name": media_name or media_generation_id,
             "video_url": video_url,
             "video_media_id": video_media_id,
             "aspect_ratio": video_info.get("aspectRatio", "VIDEO_ASPECT_RATIO_LANDSCAPE"),
@@ -2038,8 +2048,11 @@ class GenerationHandler:
             "打码服务资源不足",
             "打码服务资源阻塞",
             "yescaptcha",
+            "flow2api_team",
             "capsolver",
             "captcharun",
+            "twocaptcha",
+            "2captcha",
             "capmonster",
             "ezcaptcha",
         )
@@ -2106,7 +2119,7 @@ class GenerationHandler:
                         f"上传 {len(images)} 张参考图片...\n"
                     )
 
-                # 本地补丁：同一项目内相同参考图复用已上传的 mediaId，其余并行上传
+                # 本地补丁：同一 token 下相同参考图复用已上传的 mediaId，其余并行上传
                 upload_keys = [
                     self._upload_cache_key(token.id, image_bytes)
                     for image_bytes in images
@@ -2988,26 +3001,39 @@ class GenerationHandler:
             response_state = self._create_response_state()
 
         normalized_tier = normalize_user_paygate_tier(token.user_paygate_tier)
-        max_attempts = config.max_poll_attempts
-        poll_interval = config.poll_interval
-        
-        # 如果需要放大，轮询次数加倍（放大可能需要 30 分钟）
-        if upsample_config:
-            max_attempts = max_attempts * 3  # 放大需要更长时间
+        poll_interval = max(0.1, float(config.poll_interval))
+        max_attempts = _video_poll_attempt_budget(
+            config.video_timeout,
+            poll_interval,
+            upsample=bool(upsample_config),
+        )
+        poll_budget_seconds = max_attempts * poll_interval
+        poll_deadline = time.monotonic() + poll_budget_seconds
 
         consecutive_poll_errors = 0
         last_poll_error: Optional[Exception] = None
         max_consecutive_poll_errors = 3
 
         for attempt in range(max_attempts):
-            await asyncio.sleep(poll_interval)
+            remaining = poll_deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(poll_interval, remaining))
+            remaining = poll_deadline - time.monotonic()
+            if remaining <= 0:
+                break
 
             try:
-                result = await self.flow_client.check_video_status(
-                    token.at,
-                    operations,
-                    token_id=token.id,
-                    google_cookies=getattr(token, "google_cookies", None),
+                # Include the status RPC itself in the wall-time budget. The outer
+                # deadline prevents slow retries from extending video_timeout.
+                result = await asyncio.wait_for(
+                    self.flow_client.check_video_status(
+                        token.at,
+                        operations,
+                        token_id=token.id,
+                        google_cookies=getattr(token, "google_cookies", None),
+                    ),
+                    timeout=remaining,
                 )
                 checked_operations = result.get("operations", [])
                 consecutive_poll_errors = 0
@@ -3285,16 +3311,6 @@ class GenerationHandler:
                     yield self._create_error_response(error_msg, status_code=502)
                     return
                     
-                elif status == "MEDIA_GENERATION_STATUS_ACTIVE" and attempt > 80:
-                    # 如果持续4分钟（80次 * 3秒 = 240秒）依然是 ACTIVE 状态，则判定为卡死
-                    error_msg = "视频生成超时 (上游卡顿超过4分钟，已自动取消)"
-                    await self._fail_video_task(checked_operations, error_msg)
-                    self._mark_generation_failed(generation_result, error_msg)
-                    if stream:
-                        yield self._create_stream_chunk(f"错误: {error_msg}\n")
-                    yield self._create_error_response(error_msg, status_code=504)
-                    return
-
             except Exception as e:
                 last_poll_error = e
                 consecutive_poll_errors += 1
@@ -3313,7 +3329,7 @@ class GenerationHandler:
         if last_poll_error is not None:
             error_msg = f"视频状态查询持续失败: {self._normalize_error_message(last_poll_error)}"
         else:
-            error_msg = f"视频生成超时 (已轮询 {max_attempts} 次)"
+            error_msg = f"视频生成超时 (超过 {int(poll_budget_seconds)} 秒仍未完成)"
         await self._fail_video_task(operations, error_msg)
         self._mark_generation_failed(generation_result, error_msg)
         yield self._create_error_response(error_msg, status_code=504)
