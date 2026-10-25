@@ -257,8 +257,9 @@ class ImageModelRolloutTests(unittest.IsolatedAsyncioTestCase):
             ("IMAGE_ASPECT_RATIO_LANDSCAPE", 3),
             ("IMAGE_ASPECT_RATIO_PORTRAIT", 2),
             ("IMAGE_ASPECT_RATIO_SQUARE", 1),
-            ("IMAGE_ASPECT_RATIO_LANDSCAPE_FOUR_THREE", 4),
-            ("IMAGE_ASPECT_RATIO_PORTRAIT_THREE_FOUR", 5),
+            # 本地补丁：新版前端 WXa 枚举 4:3=5、3:4=4
+            ("IMAGE_ASPECT_RATIO_LANDSCAPE_FOUR_THREE", 5),
+            ("IMAGE_ASPECT_RATIO_PORTRAIT_THREE_FOUR", 4),
         )
         for mode in ("browser", "personal"):
             for model in ("BELUGA", "HARBOR_SEAL", "GEM_PIX_2"):

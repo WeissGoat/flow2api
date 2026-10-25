@@ -34,7 +34,33 @@ class LocalCaptchaActionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn(json.dumps(action), page.evaluate.call_args.args[0])
                 browser._harvest_token_via_ui_submit.assert_not_awaited()
                 self.assertIsNone(browser._last_harvest_session_id)
-                page.close.assert_awaited_once()
+                # 本地补丁：成功后页面保留为常驻打码页
+                page.close.assert_not_awaited()
+                self.assertIs(browser._warm_captcha_page, page)
+
+    async def test_warm_page_is_reused_for_next_action(self):
+        browser = object.__new__(TokenBrowser)
+        browser.token_id = 7
+        browser._apply_browser_environment_patch = AsyncMock()
+        browser._prepare_flow_runtime_page = AsyncMock(return_value=True)
+        browser._harvest_token_via_ui_submit = AsyncMock()
+        page = types.SimpleNamespace(
+            add_init_script=AsyncMock(),
+            evaluate=AsyncMock(return_value={"ok": True, "token": "captcha"}),
+            close=AsyncMock(),
+            is_closed=lambda: False,
+            mouse=types.SimpleNamespace(move=AsyncMock()),
+        )
+        context = types.SimpleNamespace(new_page=AsyncMock(return_value=page))
+        page.context = context
+        for action in ("UPLOAD_IMAGE", "IMAGE_GENERATION"):
+            token = await browser._execute_captcha(
+                context, "project", "site-key", action
+            )
+            self.assertEqual(token, "captcha")
+        context.new_page.assert_awaited_once()
+        self.assertIn(json.dumps("IMAGE_GENERATION"), page.evaluate.call_args.args[0])
+        self.assertEqual(browser._warm_captcha_uses, 2)
 
     async def test_execution_failure_closes_page_without_chat_fallback(self):
         browser = object.__new__(TokenBrowser)

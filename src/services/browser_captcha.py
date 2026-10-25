@@ -2261,7 +2261,7 @@ class TokenBrowser:
     async def _execute_on_warm_captcha_page(
         self, context, website_key: str, action: str
     ) -> Optional[str]:
-        page = self._warm_captcha_page
+        page = getattr(self, "_warm_captcha_page", None)
         if page is None:
             return None
         try:
@@ -2296,7 +2296,7 @@ class TokenBrowser:
             return None
 
     async def _close_warm_captcha_page(self):
-        page = self._warm_captcha_page
+        page = getattr(self, "_warm_captcha_page", None)
         self._warm_captcha_page = None
         if page is not None:
             try:
